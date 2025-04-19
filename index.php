@@ -413,7 +413,7 @@ $featuredCars = $featuredCarsStmt->fetchAll();
 </head>
 <body>
     <nav>
-        <div class="logo">CarRental</div>
+        <div class="logo">MIBESA</div>
         <ul>
             <li><a href="#" onclick="showSection('home')">Home</a></li>
             <li><a href="#" onclick="showSection('cars')">Cars</a></li>
@@ -545,8 +545,10 @@ $featuredCars = $featuredCarsStmt->fetchAll();
 
     <section id="about" style="display:none;">
         <div class="about-content">
-            <h2>About CarRental</h2>
-            <p>CarRental is Zambia's leading car rental platform, established in 2025. We provide a seamless and secure way for individuals to rent and share vehicles within the community.</p>
+            <h2>About Mibesa</h2>
+            <p>Mibesa Car Hire is committed to providing quality and affordable car
+      rental services tailored to your needs. Our fleet includes a wide range
+      of vehicles suitable for every occasion.</p>
             <h3>Our Mission</h3>
             <p>To offer reliable, convenient, and affordable car rental services while ensuring the highest standards of customer satisfaction and safety.</p>
             <h3>Why Choose Us?</h3>
