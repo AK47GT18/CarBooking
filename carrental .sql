@@ -3,7 +3,7 @@
 -- https://www.phpmyadmin.net/
 --
 -- Host: 127.0.0.1
--- Generation Time: Apr 19, 2025 at 12:23 PM
+-- Generation Time: Apr 19, 2025 at 04:50 PM
 -- Server version: 10.4.32-MariaDB
 -- PHP Version: 8.0.30
 
@@ -130,7 +130,7 @@ CREATE TABLE `users` (
   `kin_name` varchar(100) NOT NULL,
   `kin_relationship` varchar(50) NOT NULL,
   `kin_phone` varchar(15) NOT NULL,
-  `national_id` varchar(255) NOT NULL,
+  `national_id` longtext DEFAULT NULL,
   `status` enum('pending','approved','declined') DEFAULT 'pending',
   `created_at` timestamp NOT NULL DEFAULT current_timestamp(),
   `has_paid` tinyint(1) DEFAULT 0,
