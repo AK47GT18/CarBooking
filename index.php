@@ -447,15 +447,17 @@ $featuredCars = $featuredCarsStmt->fetchAll();
     <section id="home">
         <div class="slider">
             <div class="slides">
-                <div class="slide"><img src="https://via.placeholder.com/1200x400?text=Car+1" alt="Car 1"></div>
-                <div class="slide"><img src="https://via.placeholder.com/1200x400?text=Car+2" alt="Car 2"></div>
-                <div class="slide"><img src="https://via.placeholder.com/1200x400?text=Car+3" alt="Car 3"></div>
-                <div class="slide"><img src="https://via.placeholder.com/1200x400?text=Car+4" alt="Car 4"></div>
+                <div class="slide"><img src="img/car.jpg" alt="Car 1"></div>
+                <div class="slide"><img src="img/car2.jpg" alt="Car 2"></div>
+                <div class="slide"><img src="img/car3.jpg" alt="Car 3"></div>
+                <div class="slide"><img src="img/car4.jpg" alt="Car 4"></div>
             </div>
         </div>
         <div class="about-content">
             <h2>About Us</h2>
-            <p>Welcome to CarRental, Zambia's premier car rental platform. Established in 2025, we've revolutionized the way people rent and share vehicles in our community. Our mission is to provide reliable, secure, and convenient car rental services while maintaining the highest standards of customer satisfaction.</p>
+            <p>Mibesa Car Hire is committed to providing quality and affordable car
+      rental services tailored to your needs. Our fleet includes a wide range
+      of vehicles suitable for every occasion.</p>
             <h3>Our Services</h3>
             <ul>
                 <li>Peer-to-peer car rental services</li>
