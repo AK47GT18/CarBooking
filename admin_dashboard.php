@@ -2,11 +2,9 @@
 require 'config.php';
 
 
-/* Check if admin is logged in
-if (!isset($_SESSION['admin_id'])) {
-    header("Location: admin_login.php");
-    exit;
-}*/
+
+// Check if admin is logged in
+
 
 // Function to verify PayChangu payment
 function verifyPayment($pdo, $tx_ref) {

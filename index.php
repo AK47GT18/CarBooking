@@ -137,10 +137,15 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_POST['signup'])) {
     $address = $_POST['address'];
     $location = $_POST['location'];
     $national_id = $_FILES['national_id']['name'];
+    $kin_name = $_POST['kin_name'];
+    $kin_relationship = $_POST['kin_relationship'];
+    $kin_phone = $_POST['kin_phone'];
 
     // Validate phone number
-    if (!preg_match('/^\+260[0-9]{9}$/', $phone)) {
-        $error = "Invalid phone number format. Use +260 followed by 9 digits.";
+    if (!preg_match('/^\+265[0-9]{9}$/', $phone)) {
+        $error = "Invalid phone number format. Use +265 followed by 9 digits.";
+    } elseif (!preg_match('/^\+265[0-9]{9}$/', $kin_phone)) {
+        $error = "Invalid next of kin phone number format. Use +265 followed by 9 digits.";
     } else {
         // Upload national ID
         $target_dir = "Uploads/";
@@ -153,11 +158,16 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_POST['signup'])) {
 
         $user_id = $pdo->lastInsertId();
 
+        // Insert next of kin
+        $stmt = $pdo->prepare("INSERT INTO next_of_kin (user_id, name, relationship, phone) VALUES (?, ?, ?, ?)");
+        $stmt->execute([$user_id, $kin_name, $kin_relationship, $kin_phone]);
+
         // Initiate USSD payment for signup (500 Kwacha)
         $payment = initiateUSSDPayment($pdo, $user_id, 500, 'signup');
         if (isset($payment['error'])) {
             $error = $payment['error'];
             $pdo->prepare("DELETE FROM users WHERE id = ?")->execute([$user_id]);
+            $pdo->prepare("DELETE FROM next_of_kin WHERE user_id = ?")->execute([$user_id]);
         } else {
             // Notify admin
             $adminStmt = $pdo->query("SELECT email FROM admins");
@@ -251,8 +261,8 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_POST['update_profile'])) {
     $location = $_POST['edit_location'];
 
     // Validate phone number
-    if (!preg_match('/^\+260[0-9]{9}$/', $phone)) {
-        $error = "Invalid phone number format. Use +260 followed by 9 digits.";
+    if (!preg_match('/^\+265[0-9]{9}$/', $phone)) {
+        $error = "Invalid phone number format. Use +265 followed by 9 digits.";
     } else {
         $stmt = $pdo->prepare("UPDATE users SET email = ?, phone = ?, gender = ?, address = ?, location = ? WHERE id = ?");
         $stmt->execute([$email, $phone, $gender, $address, $location, $_SESSION['user_id']]);
@@ -316,6 +326,10 @@ $cars = $carsStmt->fetchAll();
 // Fetch featured cars
 $featuredCarsStmt = $pdo->query("SELECT * FROM cars WHERE featured = 1 LIMIT 3");
 $featuredCars = $featuredCarsStmt->fetchAll();
+
+// Fetch available cars for booking page
+$availableCarsStmt = $pdo->query("SELECT * FROM cars WHERE status = 'available'");
+$availableCars = $availableCarsStmt->fetchAll();
 ?>
 
 <!DOCTYPE html>
@@ -334,7 +348,9 @@ $featuredCars = $featuredCarsStmt->fetchAll();
         nav ul li { margin-left: 1.5rem; }
         nav ul li a { text-decoration: none; color: #fff; transition: color 0.3s ease; }
         nav ul li a:hover { color: #66fcf1; }
-        .profile-icon { font-size: 1.2rem; }
+        .profile-container { display: flex; align-items: center; }
+        .profile-icon { font-size: 1.2rem; margin-right: 0.5rem; }
+        .username { color: #fff; font-size: 1rem; }
         .slider { flex-grow: 1; position: relative; overflow: hidden; height: 60vh; }
         .slides { height: 100%; width: 400%; display: flex; animation: slide 15s infinite alternate; }
         .slide { width: 100%; height: 100%; }
@@ -351,8 +367,8 @@ $featuredCars = $featuredCarsStmt->fetchAll();
         .alert { background: #ffdddd; border-left: 6px solid #f44336; padding: 10px; margin-bottom: 15px; }
         .success { background: #ddffdd; border-left: 6px solid #4caf50; padding: 10px; margin-bottom: 15px; }
         .inline-error { color: #f44336; font-size: 0.8rem; margin-top: -10px; margin-bottom: 10px; display: none; }
-        .about-content { padding: 40px; max-width: 1200px; margin: 0 auto; }
-        .about-content h2 { color: #0b0c10; margin-bottom: 20px; }
+        .about-content, .bookings-content, .booking-content { padding: 40px; max-width: 1200px; margin: 0 auto; }
+        .about-content h2, .bookings-content h2, .booking-content h2 { color: #0b0c10; margin-bottom: 20px; }
         .about-content h3 { color: #45a29e; margin: 20px 0 10px; }
         .about-content ul, .about-content ol { margin-left: 20px; margin-bottom: 15px; }
         .about-content li { margin-bottom: 8px; }
@@ -371,10 +387,16 @@ $featuredCars = $featuredCarsStmt->fetchAll();
         .slider-container { overflow-x: auto; white-space: nowrap; background: #0b0c10; padding: 1rem 0; }
         .slider-container img { width: 300px; height: 180px; margin: 0 10px; border-radius: 10px; display: inline-block; object-fit: cover; }
         .section-header { padding: 2rem; font-size: 1.6rem; color: #0b0c10; }
-        .controls { display: flex; justify-content: center; gap: 1rem; margin: 1rem 0; flex-wrap: wrap; }
-        .controls input[type="text"], .controls select, .controls button { padding: 0.5rem 1rem; border-radius: 8px; border: 1px solid #ccc; }
-        .controls button { background: #0b0c10; color: #fff; border: none; cursor: pointer; }
+        .controls { display: flex; flex-direction: row; align-items: center; gap: 1rem; margin: 1rem 0; white-space: nowrap; }
+        .controls input[type="text"], .controls select, .controls button { padding: 0.5rem 1rem; border-radius: 8px; border: 1px solid #ccc; height: 40px; font-size: 1rem; }
+        .controls input[type="text"] { flex: 1; min-width: 200px; }
+        .controls select { min-width: 150px; }
+        .controls button { background: #0b0c10; color: #fff; border: none; cursor: pointer; min-width: 100px; }
         .controls button:hover { background: #66fcf1; color: #0b0c10; }
+        @media (max-width: 768px) {
+            .controls { flex-wrap: wrap; }
+            .controls input[type="text"], .controls select, .controls button { width: 100%; margin-bottom: 0.5rem; }
+        }
         .grid-container { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 1.5rem; padding: 2rem; max-width: 1200px; margin: 0 auto; }
         .car-card { background: white; border-radius: 12px; box-shadow: 0 4px 20px rgba(0,0,0,0.05); overflow: hidden; transition: transform 0.3s ease; display: flex; flex-direction: column; justify-content: space-between; }
         .car-card:hover { transform: translateY(-5px); }
@@ -391,7 +413,7 @@ $featuredCars = $featuredCarsStmt->fetchAll();
         .step-buttons { display: flex; justify-content: space-between; gap: 10px; }
         .step-buttons button { width: 48%; transition: background 0.3s ease; }
         .step-buttons button:disabled { background: #ccc; cursor: not-allowed; }
-        .profile-content { padding: 40px; max-width: 1200px; margin: 0 auto; }
+        .profile-content, .bookings-content, .booking-content { padding: 40px; max-width: 1200px; margin: 0 auto; }
         .profile-header { display: flex; align-items: center; margin-bottom: 20px; }
         .profile-pic { width: 100px; height: 100px; border-radius: 50%; object-fit: cover; margin-right: 20px; }
         .profile-details { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; margin-bottom: 20px; }
@@ -402,10 +424,12 @@ $featuredCars = $featuredCarsStmt->fetchAll();
         .bookings-table th, .bookings-table td { padding: 12px; text-align: left; border-bottom: 1px solid #eee; }
         .bookings-table th { background: #0b0c10; color: white; }
         .bookings-table tr:hover { background: #f8f9fa; }
-        .edit-profile-btn { background: #45a29e; color: white; padding: 10px 20px; border: none; border-radius: 8px; cursor: pointer; margin-top: 20px; }
-        .edit-profile-btn:hover { background: #66fcf1; color: #0b0c10; }
+        .edit-profile-btn, .new-booking-btn { background: #45a29e; color: white; padding: 10px 20px; border: none; border-radius: 8px; cursor: pointer; margin-top: 20px; }
+        .edit-profile-btn:hover, .new-booking-btn:hover { background: #66fcf1; color: #0b0c10; }
         .verify-btn { background: #45a29e; color: white; padding: 8px 16px; border: none; border-radius: 8px; cursor: pointer; margin-top: 10px; }
         .verify-btn:hover { background: #66fcf1; color: #0b0c10; }
+        .booking-form { background: white; padding: 20px; border-radius: 12px; box-shadow: 0 4px 20px rgba(0,0,0,0.05); margin-bottom: 2rem; }
+        .booking-form h3 { color: #45a29e; margin-bottom: 1rem; }
         @media (min-width: 900px) {
             .grid-container { grid-template-columns: repeat(3, 1fr); }
         }
@@ -420,7 +444,13 @@ $featuredCars = $featuredCarsStmt->fetchAll();
             <li><a href="#" onclick="showSection('about')">About</a></li>
             <li><a href="#" onclick="showSection('contact')">Contact</a></li>
             <?php if (isset($_SESSION['user_id'])): ?>
-                <li><a href="#" onclick="showSection('profile')" title="Profile"><i class="fas fa-user profile-icon"></i></a></li>
+                <li><a href="#" onclick="showSection('bookings')">Bookings</a></li>
+                <li>
+                    <a href="#" onclick="showSection('profile')" class="profile-container">
+                        <i class="fas fa-user profile-icon"></i>
+                        <span class="username"><?php echo htmlspecialchars($user['username'] ?? $user['email']); ?></span>
+                    </a>
+                </li>
                 <li><a href="logout.php">Logout</a></li>
             <?php else: ?>
                 <li><a href="#" id="loginBtn">Login</a></li>
@@ -487,7 +517,7 @@ $featuredCars = $featuredCarsStmt->fetchAll();
 
         <h2 class="section-header">Featured Cars</h2>
         <div class="controls">
-            <form method="GET" action="index.php" style="display: flex; gap: 1rem; flex-wrap: wrap;">
+            <form method="GET" action="index.php" style="display: flex; flex-direction: row; align-items: center; gap: 1rem; width: 100%;">
                 <input type="hidden" name="section" value="cars">
                 <input type="text" name="search" placeholder="Search by name or model..." value="<?php echo htmlspecialchars($search); ?>">
                 <select name="fuel">
@@ -579,6 +609,105 @@ $featuredCars = $featuredCarsStmt->fetchAll();
         </div>
     </section>
 
+    <section id="bookings" style="display:none;">
+        <div class="bookings-content">
+            <h2>Your Bookings</h2>
+            <button class="new-booking-btn" onclick="showSection('booking')">New Booking</button>
+            <div class="controls">
+                <input type="text" id="bookingSearch" placeholder="Search by car name or booking ID...">
+                <select id="bookingStatusFilter">
+                    <option value="">All Statuses</option>
+                    <option value="pending">Pending</option>
+                    <option value="booked">Booked</option>
+                    <option value="completed">Completed</option>
+                    <option value="cancelled">Cancelled</option>
+                </select>
+                <button onclick="filterBookings()">Filter</button>
+                <button onclick="resetBookingFilter()">Clear</button>
+            </div>
+            <table class="bookings-table" id="bookingsTable">
+                <thead>
+                    <tr>
+                        <th>Car</th>
+                        <th>Booking ID</th>
+                        <th>Pick-up Date</th>
+                        <th>Return Date</th>
+                        <th>Status</th>
+                        <th>Total Cost</th>
+                        <th>Payment Status</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <?php
+                    if (isset($_SESSION['user_id'])) {
+                        $stmt = $pdo->prepare("SELECT b.*, c.name AS car_name FROM bookings b LEFT JOIN cars c ON b.car_id = c.id WHERE b.user_id = ? ORDER BY b.created_at DESC");
+                        $stmt->execute([$_SESSION['user_id']]);
+                        $bookings = $stmt->fetchAll();
+                        foreach ($bookings as $booking):
+                    ?>
+                        <tr>
+                            <td><?php echo htmlspecialchars($booking['car_name']); ?></td>
+                            <td><?php echo htmlspecialchars($booking['booking_id']); ?></td>
+                            <td><?php echo htmlspecialchars($booking['pick_up_date']); ?></td>
+                            <td><?php echo htmlspecialchars($booking['return_date']); ?></td>
+                            <td><?php echo htmlspecialchars($booking['status']); ?></td>
+                            <td><?php echo htmlspecialchars($booking['total_cost']); ?> Kwacha</td>
+                            <td><?php echo htmlspecialchars($booking['payment_status']); ?></td>
+                        </tr>
+                    <?php endforeach; }
+                    ?>
+                </tbody>
+            </table>
+        </div>
+    </section>
+
+    <section id="booking" style="display:none;">
+        <div class="booking-content">
+            <h2>Create a New Booking</h2>
+            <div class="booking-form">
+                <h3>Book a Car</h3>
+                <form id="newBookingForm" method="POST">
+                    <label for="bookingCarId">Select Car:</label>
+                    <select id="bookingCarId" name="car_id" required onchange="updatePricePerDay()">
+                        <option value="">Select a Car</option>
+                        <?php foreach ($availableCars as $car): ?>
+                            <option value="<?php echo $car['id']; ?>" data-name="<?php echo htmlspecialchars($car['name']); ?>" data-price="<?php echo htmlspecialchars($car['price_per_day'] ?? '50'); ?>">
+                                <?php echo htmlspecialchars($car['name'] . ' (' . $car['model'] . ')'); ?>
+                            </option>
+                        <?php endforeach; ?>
+                    </select>
+                    <span class="inline-error" id="bookingCarIdError">Please select a car</span>
+                    <label for="carName">Car:</label>
+                    <input type="text" id="carName" readonly>
+                    <input type="hidden" id="pricePerDay" name="price_per_day">
+                    <label for="pick_up_date">Pick-up Date:</label>
+                    <input type="date" id="pick_up_date" name="pick_up_date" required min="2025-04-19">
+                    <span class="inline-error" id="pickUpDateError">Pick-up date must be today or later</span>
+                    <label for="return_date">Return Date:</label>
+                    <input type="date" id="return_date" name="return_date" required min="2025-04-19">
+                    <span class="inline-error" id="returnDateError">Return date must be after pick-up date</span>
+                    <label for="totalCost">Estimated Cost:</label>
+                    <input type="text" id="totalCost" readonly>
+                    <button type="submit" name="book">Confirm Booking</button>
+                </form>
+            </div>
+            <h2>Available Cars</h2>
+            <div class="grid-container">
+                <?php foreach ($availableCars as $car): ?>
+                    <div class="car-card">
+                        <img src="<?php echo !empty($car['image']) && strpos($car['image'], 'data:image/') === 0 ? htmlspecialchars($car['image']) : 'https://via.placeholder.com/300x200?text=Car'; ?>" alt="<?php echo htmlspecialchars($car['name']); ?>">
+                        <div class="details">
+                            <h3><?php echo htmlspecialchars($car['name']); ?></h3>
+                            <p>Model: <?php echo htmlspecialchars($car['model']); ?> | Fuel: <?php echo htmlspecialchars($car['fuel_type']); ?> | Capacity: <?php echo htmlspecialchars($car['capacity']); ?> Seater</p>
+                            <p>Price: <?php echo htmlspecialchars($car['price_per_day'] ?? '50'); ?> Kwacha/day</p>
+                            <button onclick="selectCarForBooking(<?php echo $car['id']; ?>, '<?php echo htmlspecialchars($car['name']); ?>', <?php echo htmlspecialchars($car['price_per_day'] ?? '50'); ?>)">Book Now</button>
+                        </div>
+                    </div>
+                <?php endforeach; ?>
+            </div>
+        </div>
+    </section>
+
     <section id="profile" style="display:none;">
         <div class="profile-content">
             <h2>User Profile</h2>
@@ -614,18 +743,18 @@ $featuredCars = $featuredCarsStmt->fetchAll();
             <button class="edit-profile-btn" onclick="showEditProfileModal()">Edit Profile</button>
             <h3>Your Bookings</h3>
             <div class="controls">
-                <input type="text" id="bookingSearch" placeholder="Search by car name...">
-                <select id="bookingStatusFilter">
+                <input type="text" id="profileBookingSearch" placeholder="Search by car name...">
+                <select id="profileBookingStatusFilter">
                     <option value="">All Statuses</option>
                     <option value="pending">Pending</option>
-                    <option value="approved">Approved</option>
+                    <option value="booked">Booked</option>
                     <option value="completed">Completed</option>
                     <option value="cancelled">Cancelled</option>
                 </select>
-                <button onclick="filterBookings()">Filter</button>
-                <button onclick="resetBookingFilter()">Clear</button>
+                <button onclick="filterProfileBookings()">Filter</button>
+                <button onclick="resetProfileBookingFilter()">Clear</button>
             </div>
-            <table class="bookings-table" id="bookingsTable">
+            <table class="bookings-table" id="profileBookingsTable">
                 <thead>
                     <tr>
                         <th>Car</th>
@@ -692,7 +821,8 @@ $featuredCars = $featuredCarsStmt->fetchAll();
             <div class="signup-progress">
                 <div class="progress-step active" id="progress1">Basic Info</div>
                 <div class="progress-step" id="progress2">Personal Details</div>
-                <div class="progress-step" id="progress3">Documents</div>
+                <div class="progress-step" id="progress3">Next of Kin</div>
+                <div class="progress-step" id="progress4">Documents</div>
             </div>
             <form id="signupForm" method="POST" enctype="multipart/form-data">
                 <div class="step" id="step1">
@@ -700,9 +830,9 @@ $featuredCars = $featuredCarsStmt->fetchAll();
                     <label for="signupEmail">Email:</label>
                     <input type="email" id="signupEmail" name="email" required>
                     <span class="inline-error" id="signupEmailError">Valid email required</span>
-                    <label for="phone">Phone Number (+260):</label>
-                    <input type="tel" id="phone" name="phone" pattern="\+260[0-9]{9}" placeholder="+260123456789" required>
-                    <span class="inline-error" id="phoneError">Phone number must be in +260 format</span>
+                    <label for="phone">Phone Number (+265):</label>
+                    <input type="tel" id="phone" name="phone" pattern="\+265[0-9]{9}" placeholder="+265123456789" required>
+                    <span class="inline-error" id="phoneError">Phone number must be in +265 format</span>
                     <label for="signupPassword">Password:</label>
                     <input type="password" id="signupPassword" name="password" required>
                     <span class="inline-error" id="signupPasswordError">Password must be at least 8 characters</span>
@@ -745,12 +875,35 @@ $featuredCars = $featuredCarsStmt->fetchAll();
                     </div>
                 </div>
                 <div class="step" id="step3" style="display:none;">
-                    <h3>Step 3: Documents</h3>
+                    <h3>Step 3: Next of Kin</h3>
+                    <label for="kin_name">Full Name:</label>
+                    <input type="text" id="kin_name" name="kin_name" required>
+                    <span class="inline-error" id="kinNameError">Full name is required</span>
+                    <label for="kin_relationship">Relationship:</label>
+                    <select id="kin_relationship" name="kin_relationship" required>
+                        <option value="">Select Relationship</option>
+                        <option value="Parent">Parent</option>
+                        <option value="Spouse">Spouse</option>
+                        <option value="Sibling">Sibling</option>
+                        <option value="Child">Child</option>
+                        <option value="Other">Other</option>
+                    </select>
+                    <span class="inline-error" id="kinRelationshipError">Please select a relationship</span>
+                    <label for="kin_phone">Phone Number (+265):</label>
+                    <input type="tel" id="kin_phone" name="kin_phone" pattern="\+265[0-9]{9}" placeholder="+265123456789" required>
+                    <span class="inline-error" id="kinPhoneError">Phone number must be in +265 format</span>
+                    <div class="step-buttons">
+                        <button type="button" onclick="prevStep(2)">Previous</button>
+                        <button type="button" onclick="nextStep(4)">Next</button>
+                    </div>
+                </div>
+                <div class="step" id="step4" style="display:none;">
+                    <h3>Step 4: Documents</h3>
                     <label for="national_id">National ID (PDF only):</label>
                     <input type="file" id="national_id" name="national_id" accept=".pdf" required>
                     <span class="inline-error" id="nationalIdError">National ID document is required</span>
                     <div class="step-buttons">
-                        <button type="button" onclick="prevStep(2)">Previous</button>
+                        <button type="button" onclick="prevStep(3)">Previous</button>
                         <button type="submit" name="signup">Register</button>
                     </div>
                 </div>
@@ -784,18 +937,18 @@ $featuredCars = $featuredCarsStmt->fetchAll();
             <span class="close" data-target="bookingModal">×</span>
             <h2>Book a Car</h2>
             <form id="bookingForm" method="POST">
-                <input type="hidden" id="bookingCarId" name="car_id">
-                <input type="hidden" id="pricePerDay" name="price_per_day">
-                <label for="carName">Car:</label>
-                <input type="text" id="carName" readonly>
-                <label for="pick_up_date">Pick-up Date:</label>
-                <input type="date" id="pick_up_date" name="pick_up_date" required min="2025-04-19">
-                <span class="inline-error" id="pickUpDateError">Pick-up date must be today or later</span>
-                <label for="return_date">Return Date:</label>
-                <input type="date" id="return_date" name="return_date" required min="2025-04-19">
-                <span class="inline-error" id="returnDateError">Return date must be after pick-up date</span>
-                <label for="totalCost">Estimated Cost:</label>
-                <input type="text" id="totalCost" readonly>
+                <input type="hidden" id="modalBookingCarId" name="car_id">
+                <input type="hidden" id="modalPricePerDay" name="price_per_day">
+                <label for="modalCarName">Car:</label>
+                <input type="text" id="modalCarName" readonly>
+                <label for="modal_pick_up_date">Pick-up Date:</label>
+                <input type="date" id="modal_pick_up_date" name="pick_up_date" required min="2025-04-19">
+                <span class="inline-error" id="modalPickUpDateError">Pick-up date must be today or later</span>
+                <label for="modal_return_date">Return Date:</label>
+                <input type="date" id="modal_return_date" name="return_date" required min="2025-04-19">
+                <span class="inline-error" id="modalReturnDateError">Return date must be after pick-up date</span>
+                <label for="modalTotalCost">Estimated Cost:</label>
+                <input type="text" id="modalTotalCost" readonly>
                 <button type="submit" name="book">Confirm Booking</button>
             </form>
         </div>
@@ -810,9 +963,9 @@ $featuredCars = $featuredCarsStmt->fetchAll();
                 <label for="edit_email">Email:</label>
                 <input type="email" id="edit_email" name="edit_email" value="<?php echo htmlspecialchars($user['email'] ?? ''); ?>" required>
                 <span class="inline-error" id="editEmailError">Valid email required</span>
-                <label for="edit_phone">Phone Number (+260):</label>
-                <input type="tel" id="edit_phone" name="edit_phone" pattern="\+260[0-9]{9}" value="<?php echo htmlspecialchars($user['phone'] ?? ''); ?>" placeholder="+260123456789" required>
-                <span class="inline-error" id="editPhoneError">Phone number must be in +260 format</span>
+                <label for="edit_phone">Phone Number (+265):</label>
+                <input type="tel" id="edit_phone" name="edit_phone" pattern="\+265[0-9]{9}" value="<?php echo htmlspecialchars($user['phone'] ?? ''); ?>" placeholder="+265123456789" required>
+                <span class="inline-error" id="editPhoneError">Phone number must be in +265 format</span>
                 <label for="edit_gender">Gender:</label>
                 <select id="edit_gender" name="edit_gender" required>
                     <option value="">Select Gender</option>
@@ -847,306 +1000,565 @@ $featuredCars = $featuredCarsStmt->fetchAll();
     </footer>
 
     <script>
-        // Section Navigation
-        function showSection(sectionId) {
-            const sections = ['home', 'cars', 'about', 'contact', 'profile'];
-            sections.forEach(id => {
-                document.getElementById(id).style.display = id === sectionId ? 'block' : 'none';
-            });
-            if (sectionId === 'cars') {
-                document.querySelector('input[name="search"]').value = '<?php echo htmlspecialchars($search); ?>';
-                document.querySelector('select[name="fuel"]').value = '<?php echo htmlspecialchars($filter_fuel); ?>';
-                document.querySelector('select[name="status"]').value = '<?php echo htmlspecialchars($filter_status); ?>';
+// Section Navigation
+function showSection(sectionId) {
+    const sections = ['home', 'cars', 'about', 'contact', 'bookings', 'booking', 'profile'];
+    sections.forEach(id => {
+        const section = document.getElementById(id);
+        if (section) section.style.display = id === sectionId ? 'block' : 'none';
+    });
+    if (sectionId === 'cars') {
+        document.querySelector('input[name="search"]').value = '<?php echo htmlspecialchars($search); ?>';
+        document.querySelector('select[name="fuel"]').value = '<?php echo htmlspecialchars($filter_fuel); ?>';
+        document.querySelector('select[name="status"]').value = '<?php echo htmlspecialchars($filter_status); ?>';
+    }
+}
+
+// Modal Management
+function closeAllModals() {
+    document.querySelectorAll('.modal').forEach(modal => {
+        modal.style.display = 'none';
+    });
+}
+
+document.querySelectorAll('.close').forEach(btn => {
+    btn.addEventListener('click', () => {
+        const target = btn.getAttribute('data-target');
+        const modal = document.getElementById(target);
+        if (modal) modal.style.display = 'none';
+    });
+});
+
+document.getElementById('loginBtn')?.addEventListener('click', e => {
+    e.preventDefault();
+    closeAllModals();
+    document.getElementById('loginModal').style.display = 'block';
+});
+
+window.addEventListener('click', e => {
+    if (e.target.classList.contains('modal')) {
+        e.target.style.display = 'none';
+    }
+});
+
+// Modal Switching
+document.getElementById('showSignup')?.addEventListener('click', e => {
+    e.preventDefault();
+    closeAllModals();
+    showStep(1);
+    document.getElementById('signupModal').style.display = 'block';
+});
+
+document.getElementById('showLogin')?.addEventListener('click', e => {
+    e.preventDefault();
+    closeAllModals();
+    document.getElementById('loginModal').style.display = 'block';
+});
+
+document.getElementById('showForgot')?.addEventListener('click', e => {
+    e.preventDefault();
+    closeAllModals();
+    document.getElementById('forgotModal').style.display = 'block';
+});
+
+document.getElementById('backToLogin')?.addEventListener('click', e => {
+    e.preventDefault();
+    closeAllModals();
+    document.getElementById('loginModal').style.display = 'block';
+});
+
+// Edit Profile Modal
+function showEditProfileModal() {
+    closeAllModals();
+    document.getElementById('editProfileModal').style.display = 'block';
+}
+
+// Slider Control
+let currentSlide = 0;
+const slides = document.querySelectorAll('.slide');
+const totalSlides = slides.length;
+
+function showSlide(index) {
+    if (index >= totalSlides) currentSlide = 0;
+    else if (index < 0) currentSlide = totalSlides - 1;
+    else currentSlide = index;
+
+    const slidesContainer = document.querySelector('.slides');
+    if (slidesContainer) {
+        slidesContainer.style.transform = `translateX(-${currentSlide * 100}%)`;
+    }
+}
+
+function nextSlide() {
+    showSlide(currentSlide + 1);
+}
+
+function prevSlide() {
+    showSlide(currentSlide - 1);
+}
+
+// Auto-slide every 5 seconds
+if (totalSlides > 0) {
+    setInterval(nextSlide, 5000);
+    showSlide(0); // Initialize first slide
+}
+
+// Optional: Add click-to-advance for slider
+document.querySelector('.slider')?.addEventListener('click', () => {
+    nextSlide();
+});
+
+// Booking Modal with Date Validation
+function showBookingModal(carId, carName, pricePerDay) {
+    closeAllModals();
+    const modal = document.getElementById('bookingModal');
+    if (modal) {
+        document.getElementById('modalBookingCarId').value = carId;
+        document.getElementById('modalCarName').value = carName;
+        document.getElementById('modalPricePerDay').value = pricePerDay;
+        modal.style.display = 'block';
+        setupBookingForm('modal');
+    }
+}
+
+// Select Car for Booking Page
+function selectCarForBooking(carId, carName, pricePerDay) {
+    const bookingForm = document.getElementById('newBookingForm');
+    if (bookingForm) {
+        document.getElementById('bookingCarId').value = carId;
+        document.getElementById('carName').value = carName;
+        document.getElementById('pricePerDay').value = pricePerDay;
+        document.getElementById('pick_up_date').value = '';
+        document.getElementById('return_date').value = '';
+        document.getElementById('totalCost').value = '';
+        setupBookingForm('');
+    }
+}
+
+// Update Price Per Day on Car Selection
+function updatePricePerDay() {
+    const select = document.getElementById('bookingCarId');
+    const selectedOption = select?.options[select.selectedIndex];
+    if (selectedOption) {
+        document.getElementById('carName').value = selectedOption.dataset.name;
+        document.getElementById('pricePerDay').value = selectedOption.dataset.price;
+        document.getElementById('pick_up_date').value = '';
+        document.getElementById('return_date').value = '';
+        document.getElementById('totalCost').value = '';
+    }
+}
+
+// Setup Booking Form (Modal or Page)
+function setupBookingForm(prefix = '') {
+    const pickUpDate = document.getElementById(`${prefix}pick_up_date`);
+    const returnDate = document.getElementById(`${prefix}return_date`);
+    const totalCost = document.getElementById(`${prefix}totalCost`);
+    const pricePerDayInput = document.getElementById(`${prefix}pricePerDay`);
+    const pickUpDateError = document.getElementById(`${prefix}pickUpDateError`);
+    const returnDateError = document.getElementById(`${prefix}returnDateError`);
+    const today = '2025-04-19';
+
+    if (!pickUpDate || !returnDate || !totalCost || !pricePerDayInput) return;
+
+    const pricePerDay = pricePerDayInput.value;
+
+    function updateTotalCost() {
+        pickUpDateError.style.display = 'none';
+        returnDateError.style.display = 'none';
+        totalCost.value = '';
+
+        if (pickUpDate.value && returnDate.value) {
+            const start = new Date(pickUpDate.value);
+            const end = new Date(returnDate.value);
+            const todayDate = new Date(today);
+
+            if (start < todayDate) {
+                pickUpDateError.textContent = 'Pick-up date must be today or later';
+                pickUpDateError.style.display = 'block';
+                return;
             }
+            if (end <= start) {
+                returnDateError.textContent = 'Return date must be after pick-up date';
+                returnDateError.style.display = 'block';
+                return;
+            }
+
+            const days = (end - start) / (1000 * 60 * 60 * 24);
+            totalCost.value = `${Math.ceil(days) * pricePerDay} Kwacha`;
         }
+    }
 
-        // Modal Management
-        function closeAllModals() {
-            document.querySelectorAll('.modal').forEach(modal => {
-                modal.style.display = 'none';
-            });
-        }
+    pickUpDate.addEventListener('change', updateTotalCost);
+    returnDate.addEventListener('change', updateTotalCost);
 
-        document.querySelectorAll('.close').forEach(btn => {
-            btn.addEventListener('click', () => {
-                document.getElementById(btn.getAttribute('data-target')).style.display = 'none';
-            });
-        });
+    const form = document.getElementById(`${prefix}bookingForm`);
+    if (form) {
+        form.addEventListener('submit', function(e) {
+            const start = new Date(pickUpDate.value);
+            const end = new Date(returnDate.value);
+            const todayDate = new Date(today);
 
-        document.getElementById('loginBtn')?.addEventListener('click', e => {
-            e.preventDefault();
-            closeAllModals();
-            document.getElementById('loginModal').style.display = 'block';
-        });
-
-        window.addEventListener('click', e => {
-            if (e.target.classList.contains('modal')) {
-                e.target.style.display = 'none';
-            }
-        });
-
-        // Modal Switching
-        document.getElementById('showSignup')?.addEventListener('click', e => {
-            e.preventDefault();
-            closeAllModals();
-            showStep(1);
-            document.getElementById('signupModal').style.display = 'block';
-        });
-
-        document.getElementById('showLogin')?.addEventListener('click', e => {
-            e.preventDefault();
-            closeAllModals();
-            document.getElementById('loginModal').style.display = 'block';
-        });
-
-        document.getElementById('showForgot')?.addEventListener('click', e => {
-            e.preventDefault();
-            closeAllModals();
-            document.getElementById('forgotModal').style.display = 'block';
-        });
-
-        document.getElementById('backToLogin')?.addEventListener('click', e => {
-            e.preventDefault();
-            closeAllModals();
-            document.getElementById('loginModal').style.display = 'block';
-        });
-
-        // Edit Profile Modal
-        function showEditProfileModal() {
-            closeAllModals();
-            document.getElementById('editProfileModal').style.display = 'block';
-        }
-
-        // Booking Modal with Date Validation
-        function showBookingModal(carId, carName, pricePerDay) {
-            closeAllModals();
-            document.getElementById('bookingCarId').value = carId;
-            document.getElementById('carName').value = carName;
-            document.getElementById('pricePerDay').value = pricePerDay;
-            document.getElementById('bookingModal').style.display = 'block';
-
-            const pickUpDate = document.getElementById('pick_up_date');
-            const returnDate = document.getElementById('return_date');
-            const totalCost = document.getElementById('totalCost');
-            const pickUpDateError = document.getElementById('pickUpDateError');
-            const returnDateError = document.getElementById('returnDateError');
-            const today = '2025-04-19';
-
-            function updateTotalCost() {
-                pickUpDateError.style.display = 'none';
-                returnDateError.style.display = 'none';
-                totalCost.value = '';
-
-                if (pickUpDate.value && returnDate.value) {
-                    const start = new Date(pickUpDate.value);
-                    const end = new Date(returnDate.value);
-                    const todayDate = new Date(today);
-
-                    if (start < todayDate) {
-                        pickUpDateError.textContent = 'Pick-up date must be today or later';
-                        pickUpDateError.style.display = 'block';
-                        return;
-                    }
-                    if (end <= start) {
-                        returnDateError.textContent = 'Return date must be after pick-up date';
-                        returnDateError.style.display = 'block';
-                        return;
-                    }
-
-                    const days = (end - start) / (1000 * 60 * 60 * 24);
-                    totalCost.value = `${days * pricePerDay} Kwacha`;
-                }
-            }
-
-            pickUpDate.addEventListener('change', updateTotalCost);
-            returnDate.addEventListener('change', updateTotalCost);
-
-            document.getElementById('bookingForm').addEventListener('submit', function(e) {
-                const start = new Date(pickUpDate.value);
-                const end = new Date(returnDate.value);
-                const todayDate = new Date(today);
-
-                if (start < todayDate) {
-                    e.preventDefault();
-                    pickUpDateError.textContent = 'Pick-up date must be today or later';
-                    pickUpDateError.style.display = 'block';
-                }
-                if (end <= start) {
-                    e.preventDefault();
-                    returnDateError.textContent = 'Return date must be after pick-up date';
-                    returnDateError.style.display = 'block';
-                }
-            });
-        }
-
-        // Signup Form
-        function showStep(stepNumber) {
-            document.querySelectorAll('.step').forEach(step => step.style.display = 'none');
-            document.getElementById(`step${stepNumber}`).style.display = 'block';
-            document.querySelectorAll('.progress-step').forEach(step => step.classList.remove('active'));
-            document.getElementById(`progress${stepNumber}`).classList.add('active');
-        }
-
-        function validateStep1() {
-            let valid = true;
-            const email = document.getElementById('signupEmail');
-            const phone = document.getElementById('phone');
-            const password = document.getElementById('signupPassword');
-            const confirmPassword = document.getElementById('confirmPassword');
-
-            if (!email.value.match(/^[^\s@]+@[^\s@]+\.[^\s@]+$/)) {
-                document.getElementById('signupEmailError').style.display = 'block';
-                valid = false;
-            } else {
-                document.getElementById('signupEmailError').style.display = 'none';
-            }
-
-            if (!phone.value.match(/^\+260[0-9]{9}$/)) {
-                document.getElementById('phoneError').style.display = 'block';
-                valid = false;
-            } else {
-                document.getElementById('phoneError').style.display = 'none';
-            }
-
-            if (password.value.length < 8) {
-                document.getElementById('signupPasswordError').style.display = 'block';
-                valid = false;
-            } else {
-                document.getElementById('signupPasswordError').style.display = 'none';
-            }
-
-            if (password.value !== confirmPassword.value) {
-                document.getElementById('confirmPasswordError').style.display = 'block';
-                valid = false;
-            } else {
-                document.getElementById('confirmPasswordError').style.display = 'none';
-            }
-
-            return valid;
-        }
-
-        function validateStep2() {
-            let valid = true;
-            const gender = document.getElementById('gender');
-            const address = document.getElementById('address');
-            const location = document.getElementById('location');
-
-            if (!gender.value) {
-                document.getElementById('genderError').style.display = 'block';
-                valid = false;
-            } else {
-                document.getElementById('genderError').style.display = 'none';
-            }
-
-            if (!address.value.trim()) {
-                document.getElementById('addressError').style.display = 'block';
-                valid = false;
-            } else {
-                document.getElementById('addressError').style.display = 'none';
-            }
-
-            if (!location.value) {
-                document.getElementById('locationError').style.display = 'block';
-                valid = false;
-            } else {
-                document.getElementById('locationError').style.display = 'none';
-            }
-
-            return valid;
-        }
-
-        function validateStep3() {
-            let valid = true;
-            const nationalId = document.getElementById('national_id');
-
-            if (!nationalId.files.length) {
-                document.getElementById('nationalIdError').style.display = 'block';
-                valid = false;
-            } else {
-                document.getElementById('nationalIdError').style.display = 'none';
-            }
-
-            return valid;
-        }
-
-        function nextStep(stepNumber) {
-            let valid = true;
-            if (stepNumber === 2) valid = validateStep1();
-            else if (stepNumber === 3) valid = validateStep2();
-            if (valid) showStep(stepNumber);
-        }
-
-        function prevStep(stepNumber) {
-            showStep(stepNumber);
-        }
-
-        // Contact Form Validation
-        document.getElementById('contactForm').addEventListener('submit', function(e) {
-            const email = document.getElementById('email');
-            const message = document.getElementById('message');
-            const emailError = document.getElementById('emailError');
-            const messageError = document.getElementById('messageError');
-            let valid = true;
-
-            if (!email.value.match(/^[^\s@]+@[^\s@]+\.[^\s@]+$/)) {
-                emailError.style.display = 'block';
-                valid = false;
-            } else {
-                emailError.style.display = 'none';
-            }
-
-            if (!message.value.trim()) {
-                messageError.style.display = 'block';
-                valid = false;
-            } else {
-                messageError.style.display = 'none';
-            }
-
-            if (!valid) {
+            if (start < todayDate) {
                 e.preventDefault();
+                pickUpDateError.textContent = 'Pick-up date must be today or later';
+                pickUpDateError.style.display = 'block';
+            }
+            if (end <= start) {
+                e.preventDefault();
+                returnDateError.textContent = 'Return date must be after pick-up date';
+                returnDateError.style.display = 'block';
             }
         });
+    }
+}
 
-        // Booking Filter
-        function filterBookings() {
-            const search = document.getElementById('bookingSearch').value.toLowerCase();
-            const status = document.getElementById('bookingStatusFilter').value.toLowerCase();
-            const rows = document.querySelectorAll('#bookingsTable tbody tr');
+// Initialize Booking Form on Page Load
+if (document.getElementById('newBookingForm')) {
+    setupBookingForm('');
+}
 
-            rows.forEach(row => {
-                const carName = row.cells[0].textContent.toLowerCase();
-                const rowStatus = row.cells[3].textContent.toLowerCase();
+// Signup Form
+function showStep(stepNumber) {
+    const steps = document.querySelectorAll('.step');
+    const progressSteps = document.querySelectorAll('.progress-step');
 
-                const matchesSearch = search ? carName.includes(search) : true;
-                const matchesStatus = status ? rowStatus === status : true;
+    steps.forEach(step => (step.style.display = 'none'));
+    const currentStep = document.getElementById(`step${stepNumber}`);
+    if (currentStep) currentStep.style.display = 'block';
 
-                row.style.display = matchesSearch && matchesStatus ? '' : 'none';
-            });
-        }
+    progressSteps.forEach(step => step.classList.remove('active'));
+    const currentProgress = document.getElementById(`progress${stepNumber}`);
+    if (currentProgress) currentProgress.classList.add('active');
+}
 
-        function resetBookingFilter() {
-            document.getElementById('bookingSearch').value = '';
-            document.getElementById('bookingStatusFilter').value = '';
-            filterBookings();
-        }
+function nextStep(stepNumber) {
+    if (stepNumber === 2 && !validateStep1()) return;
+    if (stepNumber === 3 && !validateStep2()) return;
+    if (stepNumber === 4 && !validateStep3()) return;
+    showStep(stepNumber);
+}
 
-        // Image Slider
-        let slideIndex = 0;
-        const slides = document.querySelectorAll('.slide');
+function prevStep(stepNumber) {
+    showStep(stepNumber);
+}
 
-        function showSlides() {
-            slides.forEach(slide => slide.style.display = 'none');
-            slideIndex = (slideIndex % slides.length) + 1;
-            slides[slideIndex - 1].style.display = 'block';
-            setTimeout(showSlides, 3000);
-        }
+function validateStep1() {
+    let valid = true;
+    const email = document.getElementById('signupEmail');
+    const phone = document.getElementById('phone');
+    const password = document.getElementById('signupPassword');
+    const confirmPassword = document.getElementById('confirmPassword');
+    const emailError = document.getElementById('signupEmailError');
+    const phoneError = document.getElementById('phoneError');
+    const passwordError = document.getElementById('signupPasswordError');
+    const confirmPasswordError = document.getElementById('confirmPasswordError');
 
-        showSlides();
+    // Reset error messages
+    emailError.style.display = 'none';
+    phoneError.style.display = 'none';
+    passwordError.style.display = 'none';
+    confirmPasswordError.style.display = 'none';
 
-        // Persist section state
-        <?php if (isset($_GET['section'])): ?>
-            showSection('<?php echo htmlspecialchars($_GET['section']); ?>');
-        <?php endif; ?>
+    if (!email.value.match(/^[^\s@]+@[^\s@]+\.[^\s@]+$/)) {
+        emailError.textContent = 'Please enter a valid email';
+        emailError.style.display = 'block';
+        valid = false;
+    }
+
+    if (!phone.value.match(/^\+265[0-9]{9}$/)) {
+        phoneError.textContent = 'Phone number must be in +265 format (e.g., +265123456789)';
+        phoneError.style.display = 'block';
+        valid = false;
+    }
+
+    if (password.value.length < 8) {
+        passwordError.textContent = 'Password must be at least 8 characters';
+        passwordError.style.display = 'block';
+        valid = false;
+    }
+
+    if (password.value !== confirmPassword.value) {
+        confirmPasswordError.textContent = 'Passwords do not match';
+        confirmPasswordError.style.display = 'block';
+        valid = false;
+    }
+
+    return valid;
+}
+
+function validateStep2() {
+    let valid = true;
+    const gender = document.getElementById('gender');
+    const address = document.getElementById('address');
+    const location = document.getElementById('location');
+    const genderError = document.getElementById('genderError');
+    const addressError = document.getElementById('addressError');
+    const locationError = document.getElementById('locationError');
+
+    // Reset error messages
+    genderError.style.display = 'none';
+    addressError.style.display = 'none';
+    locationError.style.display = 'none';
+
+    if (!gender.value) {
+        genderError.textContent = 'Please select a gender';
+        genderError.style.display = 'block';
+        valid = false;
+    }
+
+    if (!address.value.trim()) {
+        addressError.textContent = 'Address is required';
+        addressError.style.display = 'block';
+        valid = false;
+    }
+
+    if (!location.value) {
+        locationError.textContent = 'Please select a location';
+        locationError.style.display = 'block';
+        valid = false;
+    }
+
+    return valid;
+}
+
+function validateStep3() {
+    let valid = true;
+    const kinName = document.getElementById('kin_name');
+    const kinRelationship = document.getElementById('kin_relationship');
+    const kinPhone = document.getElementById('kin_phone');
+    const kinNameError = document.getElementById('kinNameError');
+    const kinRelationshipError = document.getElementById('kinRelationshipError');
+    const kinPhoneError = document.getElementById('kinPhoneError');
+
+    // Reset error messages
+    kinNameError.style.display = 'none';
+    kinRelationshipError.style.display = 'none';
+    kinPhoneError.style.display = 'none';
+
+    if (!kinName.value.trim()) {
+        kinNameError.textContent = 'Full name is required';
+        kinNameError.style.display = 'block';
+        valid = false;
+    }
+
+    if (!kinRelationship.value) {
+        kinRelationshipError.textContent = 'Please select a relationship';
+        kinRelationshipError.style.display = 'block';
+        valid = false;
+    }
+
+    if (!kinPhone.value.match(/^\+265[0-9]{9}$/)) {
+        kinPhoneError.textContent = 'Phone number must be in +265 format (e.g., +265123456789)';
+        kinPhoneError.style.display = 'block';
+        valid = false;
+    }
+
+    return valid;
+}
+
+function validateStep4() {
+    let valid = true;
+    const nationalId = document.getElementById('national_id');
+    const nationalIdError = document.getElementById('nationalIdError');
+
+    // Reset error message
+    nationalIdError.style.display = 'none';
+
+    if (!nationalId.files.length) {
+        nationalIdError.textContent = 'National ID document is required';
+        nationalIdError.style.display = 'block';
+        valid = false;
+    } else if (!nationalId.files[0].name.endsWith('.pdf')) {
+        nationalIdError.textContent = 'Only PDF files are allowed';
+        nationalIdError.style.display = 'block';
+        valid = false;
+    }
+
+    return valid;
+}
+
+// Handle Signup Form Submission
+document.getElementById('signupForm')?.addEventListener('submit', function(e) {
+    if (!validateStep4()) {
+        e.preventDefault();
+    }
+});
+
+// Bookings Table Filter
+function filterBookings() {
+    const search = document.getElementById('bookingSearch')?.value.toLowerCase() || '';
+    const status = document.getElementById('bookingStatusFilter')?.value.toLowerCase() || '';
+    const rows = document.querySelectorAll('#bookingsTable tbody tr');
+
+    rows.forEach(row => {
+        const carName = row.cells[0].textContent.toLowerCase();
+        const bookingId = row.cells[1].textContent.toLowerCase();
+        const rowStatus = row.cells[4].textContent.toLowerCase();
+
+        const matchesSearch = carName.includes(search) || bookingId.includes(search);
+        const matchesStatus = !status || rowStatus === status;
+
+        row.style.display = matchesSearch && matchesStatus ? '' : 'none';
+    });
+}
+
+function resetBookingFilter() {
+    const bookingSearch = document.getElementById('bookingSearch');
+    const bookingStatusFilter = document.getElementById('bookingStatusFilter');
+    if (bookingSearch) bookingSearch.value = '';
+    if (bookingStatusFilter) bookingStatusFilter.value = '';
+    filterBookings();
+}
+
+// Profile Bookings Table Filter
+function filterProfileBookings() {
+    const search = document.getElementById('profileBookingSearch')?.value.toLowerCase() || '';
+    const status = document.getElementById('profileBookingStatusFilter')?.value.toLowerCase() || '';
+    const rows = document.querySelectorAll('#profileBookingsTable tbody tr');
+
+    rows.forEach(row => {
+        const carName = row.cells[0].textContent.toLowerCase();
+        const rowStatus = row.cells[3].textContent.toLowerCase();
+
+        const matchesSearch = carName.includes(search);
+        const matchesStatus = !status || rowStatus === status;
+
+        row.style.display = matchesSearch && matchesStatus ? '' : 'none';
+    });
+}
+
+function resetProfileBookingFilter() {
+    const profileBookingSearch = document.getElementById('profileBookingSearch');
+    const profileBookingStatusFilter = document.getElementById('profileBookingStatusFilter');
+    if (profileBookingSearch) profileBookingSearch.value = '';
+    if (profileBookingStatusFilter) profileBookingStatusFilter.value = '';
+    filterProfileBookings();
+}
+
+// Contact Form Validation
+document.getElementById('contactForm')?.addEventListener('submit', function(e) {
+    let valid = true;
+    const email = document.getElementById('email');
+    const message = document.getElementById('message');
+    const emailError = document.getElementById('emailError');
+    const messageError = document.getElementById('messageError');
+
+    emailError.style.display = 'none';
+    messageError.style.display = 'none';
+
+    if (!email.value.match(/^[^\s@]+@[^\s@]+\.[^\s@]+$/)) {
+        emailError.textContent = 'Valid email required';
+        emailError.style.display = 'block';
+        valid = false;
+    }
+
+    if (!message.value.trim()) {
+        messageError.textContent = 'Message is required';
+        messageError.style.display = 'block';
+        valid = false;
+    }
+
+    if (!valid) e.preventDefault();
+});
+
+// Login Form Validation
+document.getElementById('loginForm')?.addEventListener('submit', function(e) {
+    let valid = true;
+    const email = document.getElementById('loginEmail');
+    const password = document.getElementById('loginPassword');
+    const emailError = document.getElementById('loginEmailError');
+    const passwordError = document.getElementById('loginPasswordError');
+
+    emailError.style.display = 'none';
+    passwordError.style.display = 'none';
+
+    if (!email.value.match(/^[^\s@]+@[^\s@]+\.[^\s@]+$/)) {
+        emailError.textContent = 'Valid email required';
+        emailError.style.display = 'block';
+        valid = false;
+    }
+
+    if (!password.value) {
+        passwordError.textContent = 'Password is required';
+        passwordError.style.display = 'block';
+        valid = false;
+    }
+
+    if (!valid) e.preventDefault();
+});
+
+// Forgot Password Form Validation
+document.getElementById('forgotForm')?.addEventListener('submit', function(e) {
+    let valid = true;
+    const email = document.getElementById('forgotEmail');
+    const emailError = document.getElementById('forgotEmailError');
+
+    emailError.style.display = 'none';
+
+    if (!email.value.match(/^[^\s@]+@[^\s@]+\.[^\s@]+$/)) {
+        emailError.textContent = 'Valid email required';
+        emailError.style.display = 'block';
+        valid = false;
+    }
+
+    if (!valid) e.preventDefault();
+});
+
+// Edit Profile Form Validation
+document.getElementById('editProfileForm')?.addEventListener('submit', function(e) {
+    let valid = true;
+    const email = document.getElementById('edit_email');
+    const phone = document.getElementById('edit_phone');
+    const gender = document.getElementById('edit_gender');
+    const address = document.getElementById('edit_address');
+    const location = document.getElementById('edit_location');
+    const emailError = document.getElementById('editEmailError');
+    const phoneError = document.getElementById('editPhoneError');
+    const genderError = document.getElementById('editGenderError');
+    const addressError = document.getElementById('editAddressError');
+    const locationError = document.getElementById('editLocationError');
+
+    emailError.style.display = 'none';
+    phoneError.style.display = 'none';
+    genderError.style.display = 'none';
+    addressError.style.display = 'none';
+    locationError.style.display = 'none';
+
+    if (!email.value.match(/^[^\s@]+@[^\s@]+\.[^\s@]+$/)) {
+        emailError.textContent = 'Valid email required';
+        emailError.style.display = 'block';
+        valid = false;
+    }
+
+    if (!phone.value.match(/^\+265[0-9]{9}$/)) {
+        phoneError.textContent = 'Phone number must be in +265 format';
+        phoneError.style.display = 'block';
+        valid = false;
+    }
+
+    if (!gender.value) {
+        genderError.textContent = 'Please select a gender';
+        genderError.style.display = 'block';
+        valid = false;
+    }
+
+    if (!address.value.trim()) {
+        addressError.textContent = 'Address is required';
+        addressError.style.display = 'block';
+        valid = false;
+    }
+
+    if (!location.value) {
+        locationError.textContent = 'Please select a location';
+        locationError.style.display = 'block';
+        valid = false;
+    }
+
+    if (!valid) e.preventDefault();
+});
+
+// Initialize default section and slider
+showSection('home');
     </script>
 </body>
 </html>
