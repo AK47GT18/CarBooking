@@ -95,6 +95,55 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_POST['delete_user'])) {
     exit;
 }
 
+// Handle user update
+if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_POST['update_user'])) {
+    $user_id = $_POST['user_id'];
+    $email = trim($_POST['email']);
+    $phone = trim($_POST['phone']);
+    $gender = $_POST['gender'];
+    $address = trim($_POST['address']);
+    $location = trim($_POST['location']);
+    $kin_name = trim($_POST['kin_name']);
+    $kin_relationship = trim($_POST['kin_relationship']);
+    $kin_phone = trim($_POST['kin_phone']);
+    $status = $_POST['status'];
+
+    // Basic validation
+    $errors = [];
+    if (empty($email) || !filter_var($email, FILTER_VALIDATE_EMAIL)) {
+        $errors[] = "A valid email is required.";
+    }
+    if (empty($phone)) {
+        $errors[] = "Phone number is required.";
+    }
+    if (empty($gender) || !in_array($gender, ['Male', 'Female', 'Other'])) {
+        $errors[] = "Valid gender is required.";
+    }
+    if (empty($address)) {
+        $errors[] = "Address is required.";
+    }
+    if (empty($location)) {
+        $errors[] = "Location is required.";
+    }
+    if (empty($status) || !in_array($status, ['pending', 'approved', 'declined'])) {
+        $errors[] = "Valid status is required.";
+    }
+
+    if (empty($errors)) {
+        $stmt = $pdo->prepare("UPDATE users SET email = ?, phone = ?, gender = ?, address = ?, location = ?, kin_name = ?, kin_relationship = ?, kin_phone = ?, status = ? WHERE id = ?");
+        $stmt->execute([$email, $phone, $gender, $address, $location, $kin_name, $kin_relationship, $kin_phone, $status, $user_id]);
+
+        // Notify user
+        sendEmail($email, "Profile Updated", "Your CarRental account details have been updated by an administrator.");
+
+        header("Location: admin_dashboard.php?section=manage-users&message=" . urlencode("User updated successfully"));
+        exit;
+    } else {
+        header("Location: admin_dashboard.php?section=manage-users&error=" . urlencode(implode(" ", $errors)));
+        exit;
+    }
+}
+
 // Handle car addition
 if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_POST['add_car'])) {
     $name = $_POST['name'];
@@ -425,6 +474,9 @@ if ($report_type) {
         <?php if (isset($_GET['message'])): ?>
             <div class="success"><?php echo htmlspecialchars($_GET['message']); ?></div>
         <?php endif; ?>
+        <?php if (isset($_GET['error'])): ?>
+            <div class="alert"><?php echo htmlspecialchars($_GET['error']); ?></div>
+        <?php endif; ?>
 
         <!-- Dashboard Section -->
         <div class="section <?php echo (!isset($_GET['section']) || $_GET['section'] == 'dashboard') ? 'active' : ''; ?>" id="dashboard">
@@ -599,6 +651,7 @@ if ($report_type) {
                                         <form method="POST" style="display:inline;">
                                             <input type="hidden" name="user_id" value="<?php echo $user['id']; ?>">
                                             <div class="action-btn-container">
+                                                <button type="button" class="action-btn edit" onclick='openEditUserModal(<?php echo json_encode($user); ?>)'>Edit</button>
                                                 <?php if ($user['status'] == 'pending' && $user['payment_status'] == 'paid'): ?>
                                                     <button type="submit" name="user_action" value="approved" class="action-btn approve">Approve</button>
                                                     <button type="submit" name="user_action" value="declined" class="action-btn decline">Decline</button>
@@ -903,6 +956,44 @@ if ($report_type) {
         </div>
     </div>
 
+    <!-- Edit User Modal -->
+    <div class="modal" id="editUserModal">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h3>Edit User</h3>
+                <span class="close" onclick="closeModal('editUserModal')">×</span>
+            </div>
+            <div class="modal-body">
+                <form method="POST">
+                    <input type="hidden" name="user_id" id="editUserId">
+                    <input type="email" name="email" id="editUserEmail" placeholder="Email" required>
+                    <input type="text" name="phone" id="editUserPhone" placeholder="Phone Number" required>
+                    <select name="gender" id="editUserGender" required>
+                        <option value="" disabled>Select Gender</option>
+                        <option value="Male">Male</option>
+                        <option value="Female">Female</option>
+                        <option value="Other">Other</option>
+                    </select>
+                    <input type="text" name="address" id="editUserAddress" placeholder="Address" required>
+                    <input type="text" name="location" id="editUserLocation" placeholder="Location" required>
+                    <input type="text" name="kin_name" id="editUserKinName" placeholder="Next of Kin Name">
+                    <input type="text" name="kin_relationship" id="editUserKinRelationship" placeholder="Kin Relationship">
+                    <input type="text" name="kin_phone" id="editUserKinPhone" placeholder="Kin Phone">
+                    <select name="status" id="editUserStatus" required>
+                        <option value="" disabled>Select Status</option>
+                        <option value="pending">Pending</option>
+                        <option value="approved">Approved</option>
+                        <option value="declined">Declined</option>
+                    </select>
+                    <div class="modal-footer">
+                        <button type="button" class="action-btn" onclick="closeModal('editUserModal')">Cancel</button>
+                        <button type="submit" name="update_user" class="action-btn approve">Update User</button>
+                    </div>
+                </form>
+            </div>
+        </div>
+    </div>
+
     <div class="footer">
         <p>© 2025 CarRental. All rights reserved.</p>
     </div>
@@ -945,6 +1036,21 @@ if ($report_type) {
             document.getElementById('editCarPricePerDay').value = car.price_per_day || 50;
             document.getElementById('editCarFeatured').checked = car.featured == 1;
             openModal('editCarModal');
+        }
+
+        // Edit user modal
+        function openEditUserModal(user) {
+            document.getElementById('editUserId').value = user.id;
+            document.getElementById('editUserEmail').value = user.email;
+            document.getElementById('editUserPhone').value = user.phone;
+            document.getElementById('editUserGender').value = user.gender;
+            document.getElementById('editUserAddress').value = user.address;
+            document.getElementById('editUserLocation').value = user.location;
+            document.getElementById('editUserKinName').value = user.kin_name || '';
+            document.getElementById('editUserKinRelationship').value = user.kin_relationship || '';
+            document.getElementById('editUserKinPhone').value = user.kin_phone || '';
+            document.getElementById('editUserStatus').value = user.status;
+            openModal('editUserModal');
         }
 
         // Profile functions
