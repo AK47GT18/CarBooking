@@ -1,10 +1,8 @@
 <?php
 require 'config.php';
 
-
-
 // Check if admin is logged in
-
+// (Assuming admin session check logic is in config.php or elsewhere)
 
 // Function to verify PayChangu payment
 function verifyPayment($pdo, $tx_ref) {
@@ -205,8 +203,11 @@ $search = isset($_GET['search']) ? trim($_GET['search']) : '';
 $filter = isset($_GET['filter']) ? $_GET['filter'] : 'all';
 
 // Users with signup payments
-$usersQuery = "SELECT u.*, p.status AS payment_status, p.amount AS payment_amount, p.tx_ref FROM users u LEFT JOIN payments p ON u.id = p.user_id AND p.type = 'signup' WHERE u.email LIKE ? OR u.address LIKE ? OR u.location LIKE ?";
-$usersParams = ["%$search%", "%$search%", "%$search%"];
+$usersQuery = "SELECT u.*, p.status AS payment_status, p.amount AS payment_amount, p.tx_ref 
+               FROM users u 
+               LEFT JOIN payments p ON u.id = p.user_id AND p.type = 'signup' 
+               WHERE u.email LIKE ? OR u.address LIKE ? OR u.location LIKE ? OR u.kin_name LIKE ? OR u.kin_phone LIKE ?";
+$usersParams = ["%$search%", "%$search%", "%$search%", "%$search%", "%$search%"];
 if ($filter != 'all') {
     $usersQuery .= " AND u.status = ?";
     $usersParams[] = $filter;
@@ -241,6 +242,45 @@ if ($filter != 'all') {
 $bookingsStmt = $pdo->prepare($bookingsQuery);
 $bookingsStmt->execute($bookingsParams);
 $bookings = $bookingsStmt->fetchAll();
+
+// Reports
+$report_type = isset($_GET['report_type']) ? $_GET['report_type'] : '';
+$report_data = [];
+if ($report_type) {
+    switch ($report_type) {
+        case 'users':
+            $stmt = $pdo->prepare("SELECT u.email, u.phone, u.gender, u.address, u.location, u.kin_name, u.kin_relationship, u.kin_phone, u.status, u.payment_status 
+                                   FROM users u 
+                                   WHERE u.email LIKE ? OR u.address LIKE ? OR u.location LIKE ? OR u.kin_name LIKE ? OR u.kin_phone LIKE ?");
+            $stmt->execute(["%$search%", "%$search%", "%$search%", "%$search%", "%$search%"]);
+            $report_data = $stmt->fetchAll();
+            break;
+        case 'payments':
+            $stmt = $pdo->prepare("SELECT p.tx_ref, p.amount, p.status, p.type, u.email, u.gender 
+                                   FROM payments p 
+                                   LEFT JOIN users u ON p.user_id = u.id 
+                                   WHERE p.tx_ref LIKE ? OR u.email LIKE ?");
+            $stmt->execute(["%$search%", "%$search%"]);
+            $report_data = $stmt->fetchAll();
+            break;
+        case 'bookings':
+            $stmt = $pdo->prepare("SELECT b.booking_id, c.name AS car_name, b.pick_up_date, b.return_date, b.total_cost, b.status, b.payment_status, u.email, u.gender 
+                                   FROM bookings b 
+                                   JOIN users u ON b.user_id = u.id 
+                                   JOIN cars c ON b.car_id = c.id 
+                                   WHERE b.booking_id LIKE ? OR u.email LIKE ? OR c.name LIKE ?");
+            $stmt->execute(["%$search%", "%$search%", "%$search%"]);
+            $report_data = $stmt->fetchAll();
+            break;
+        case 'cars':
+            $stmt = $pdo->prepare("SELECT name, model, license_plate, capacity, fuel_type, price_per_day, status 
+                                   FROM cars 
+                                   WHERE name LIKE ? OR model LIKE ? OR license_plate LIKE ?");
+            $stmt->execute(["%$search%", "%$search%", "%$search%"]);
+            $report_data = $stmt->fetchAll();
+            break;
+    }
+}
 ?>
 
 <!DOCTYPE html>
@@ -332,6 +372,8 @@ $bookings = $bookingsStmt->fetchAll();
         .footer { text-align: center; padding: 15px; background-color: #0b0c10; color: #ecf0f1; position: fixed; width: 100%; bottom: 0; left: 0; z-index: 98; font-size: 0.9rem; font-weight: 400; }
         .section { display: none; }
         .section.active { display: block; }
+        .national-id-links a { color: #45a29e; text-decoration: none; margin-right: 10px; }
+        .national-id-links a:hover { color: #66fcf1; }
         @media (max-width: 768px) {
             .sidebar { width: 200px; }
             .sidebar.collapsed { width: 0; }
@@ -357,6 +399,7 @@ $bookings = $bookingsStmt->fetchAll();
             <li onclick="showSection('manage-cars')"><i class="fas fa-car"></i> Manage Cars</li>
             <li onclick="showSection('manage-users')"><i class="fas fa-users"></i> Manage Users</li>
             <li onclick="showSection('manage-bookings')"><i class="fas fa-calendar-check"></i> Manage Bookings</li>
+            <li onclick="showSection('reports')"><i class="fas fa-chart-line"></i> Reports</li>
             <li onclick="showSection('profile')"><i class="fas fa-user"></i> Profile</li>
             <li onclick="logout()"><i class="fas fa-sign-out-alt"></i> Logout</li>
         </ul>
@@ -494,7 +537,7 @@ $bookings = $bookingsStmt->fetchAll();
                 <h1>Manage Users</h1>
             </div>
             <div class="controls">
-                <input type="text" placeholder="Search users by email, address, etc..." id="userSearch" value="<?php echo htmlspecialchars($search); ?>">
+                <input type="text" placeholder="Search users by email, address, kin name, etc..." id="userSearch" value="<?php echo htmlspecialchars($search); ?>">
                 <select id="userFilter">
                     <option value="all" <?php echo $filter == 'all' ? 'selected' : ''; ?>>All</option>
                     <option value="pending" <?php echo $filter == 'pending' ? 'selected' : ''; ?>>Pending</option>
@@ -514,6 +557,9 @@ $bookings = $bookingsStmt->fetchAll();
                                 <th>Gender</th>
                                 <th>Address</th>
                                 <th>Location</th>
+                                <th>Kin Name</th>
+                                <th>Kin Relationship</th>
+                                <th>Kin Phone</th>
                                 <th>Has Paid</th>
                                 <th>Payment Status</th>
                                 <th>Payment Amount</th>
@@ -531,13 +577,19 @@ $bookings = $bookingsStmt->fetchAll();
                                     <td><?php echo htmlspecialchars($user['gender']); ?></td>
                                     <td><?php echo htmlspecialchars($user['address']); ?></td>
                                     <td><?php echo htmlspecialchars($user['location']); ?></td>
+                                    <td><?php echo htmlspecialchars($user['kin_name'] ?? 'N/A'); ?></td>
+                                    <td><?php echo htmlspecialchars($user['kin_relationship'] ?? 'N/A'); ?></td>
+                                    <td><?php echo htmlspecialchars($user['kin_phone'] ?? 'N/A'); ?></td>
                                     <td><?php echo $user['has_paid'] ? 'Yes' : 'No'; ?></td>
                                     <td><?php echo htmlspecialchars($user['payment_status'] ?? 'N/A'); ?></td>
                                     <td><?php echo htmlspecialchars($user['payment_amount'] ?? 'N/A'); ?> MWK</td>
                                     <td><?php echo htmlspecialchars($user['tx_ref'] ?? 'N/A'); ?></td>
                                     <td>
                                         <?php if ($user['national_id']): ?>
-                                            <a href="Uploads/<?php echo htmlspecialchars($user['national_id']); ?>" target="_blank">View</a>
+                                            <div class="national-id-links">
+                                                <a href="data:application/pdf;base64,<?php echo htmlspecialchars($user['national_id']); ?>" target="_blank">View</a>
+                                                <a href="#" onclick="downloadNationalId('<?php echo htmlspecialchars($user['national_id']); ?>', '<?php echo htmlspecialchars($user['id'] . '_' . str_replace('@', '_', $user['email'])); ?>')">Download</a>
+                                            </div>
                                         <?php else: ?>
                                             N/A
                                         <?php endif; ?>
@@ -633,6 +685,124 @@ $bookings = $bookingsStmt->fetchAll();
                             <?php endforeach; ?>
                         </tbody>
                     </table>
+                </div>
+            </div>
+        </div>
+
+        <!-- Reports Section -->
+        <div class="section <?php echo (isset($_GET['section']) && $_GET['section'] == 'reports') ? 'active' : ''; ?>" id="reports">
+            <div class="dashboard-header">
+                <h1>Generate Reports</h1>
+            </div>
+            <div class="controls">
+                <form id="reportForm" method="GET" action="admin_dashboard.php">
+                    <input type="hidden" name="section" value="reports">
+                    <select name="report_type" id="reportType" required>
+                        <option value="" <?php echo $report_type == '' ? 'selected' : ''; ?>>Select Report Type</option>
+                        <option value="users" <?php echo $report_type == 'users' ? 'selected' : ''; ?>>Users</option>
+                        <option value="payments" <?php echo $report_type == 'payments' ? 'selected' : ''; ?>>Payments</option>
+                        <option value="bookings" <?php echo $report_type == 'bookings' ? 'selected' : ''; ?>>Bookings</option>
+                        <option value="cars" <?php echo $report_type == 'cars' ? 'selected' : ''; ?>>Cars</option>
+                    </select>
+                    <input type="text" name="search" placeholder="Search report data..." value="<?php echo htmlspecialchars($search); ?>">
+                    <button type="submit"><i class="fas fa-chart-line"></i> Generate Report</button>
+                </form>
+            </div>
+            <div class="content-card">
+                <h2><?php echo $report_type ? ucfirst(str_replace('_', ' ', $report_type)) . ' Report' : 'Select a Report'; ?></h2>
+                <div class="table-container">
+                    <?php if ($report_type): ?>
+                        <?php if (empty($report_data)): ?>
+                            <p>No records found for the selected report type.</p>
+                        <?php else: ?>
+                            <table class="data-table">
+                                <thead>
+                                    <tr>
+                                        <?php if ($report_type == 'users'): ?>
+                                            <th>Email</th>
+                                            <th>Phone</th>
+                                            <th>Gender</th>
+                                            <th>Address</th>
+                                            <th>Location</th>
+                                            <th>Kin Name</th>
+                                            <th>Kin Relationship</th>
+                                            <th>Kin Phone</th>
+                                            <th>Status</th>
+                                            <th>Payment Status</th>
+                                        <?php elseif ($report_type == 'payments'): ?>
+                                            <th>User Email</th>
+                                            <th>User Gender</th>
+                                            <th>Tx Ref</th>
+                                            <th>Amount</th>
+                                            <th>Status</th>
+                                            <th>Type</th>
+                                        <?php elseif ($report_type == 'bookings'): ?>
+                                            <th>User Email</th>
+                                            <th>User Gender</th>
+                                            <th>Booking ID</th>
+                                            <th>Car Name</th>
+                                            <th>Pick-up Date</th>
+                                            <th>Return Date</th>
+                                            <th>Total Cost</th>
+                                            <th>Status</th>
+                                            <th>Payment Status</th>
+                                        <?php elseif ($report_type == 'cars'): ?>
+                                            <th>Name</th>
+                                            <th>Model</th>
+                                            <th>License Plate</th>
+                                            <th>Capacity</th>
+                                            <th>Fuel Type</th>
+                                            <th>Price/Day</th>
+                                            <th>Status</th>
+                                        <?php endif; ?>
+                                    </tr>
+                                </thead>
+                                <tbody>
+                                    <?php foreach ($report_data as $row): ?>
+                                        <tr>
+                                            <?php if ($report_type == 'users'): ?>
+                                                <td><?php echo htmlspecialchars($row['email']); ?></td>
+                                                <td><?php echo htmlspecialchars($row['phone']); ?></td>
+                                                <td><?php echo htmlspecialchars($row['gender']); ?></td>
+                                                <td><?php echo htmlspecialchars($row['address']); ?></td>
+                                                <td><?php echo htmlspecialchars($row['location']); ?></td>
+                                                <td><?php echo htmlspecialchars($row['kin_name'] ?? 'N/A'); ?></td>
+                                                <td><?php echo htmlspecialchars($row['kin_relationship'] ?? 'N/A'); ?></td>
+                                                <td><?php echo htmlspecialchars($row['kin_phone'] ?? 'N/A'); ?></td>
+                                                <td><span class="status status-<?php echo strtolower($row['status']); ?>"><?php echo htmlspecialchars($row['status']); ?></span></td>
+                                                <td><?php echo htmlspecialchars($row['payment_status']); ?></td>
+                                            <?php elseif ($report_type == 'payments'): ?>
+                                                <td><?php echo htmlspecialchars($row['email'] ?? 'N/A'); ?></td>
+                                                <td><?php echo htmlspecialchars($row['gender'] ?? 'N/A'); ?></td>
+                                                <td><?php echo htmlspecialchars($row['tx_ref']); ?></td>
+                                                <td><?php echo htmlspecialchars($row['amount']); ?> MWK</td>
+                                                <td><?php echo htmlspecialchars($row['status']); ?></td>
+                                                <td><?php echo htmlspecialchars($row['type']); ?></td>
+                                            <?php elseif ($report_type == 'bookings'): ?>
+                                                <td><?php echo htmlspecialchars($row['email']); ?></td>
+                                                <td><?php echo htmlspecialchars($row['gender']); ?></td>
+                                                <td><?php echo htmlspecialchars($row['booking_id']); ?></td>
+                                                <td><?php echo htmlspecialchars($row['car_name']); ?></td>
+                                                <td><?php echo htmlspecialchars($row['pick_up_date']); ?></td>
+                                                <td><?php echo htmlspecialchars($row['return_date']); ?></td>
+                                                <td><?php echo htmlspecialchars($row['total_cost']); ?> MWK</td>
+                                                <td><span class="status status-<?php echo strtolower($row['status']); ?>"><?php echo htmlspecialchars($row['status']); ?></span></td>
+                                                <td><?php echo htmlspecialchars($row['payment_status']); ?></td>
+                                            <?php elseif ($report_type == 'cars'): ?>
+                                                <td><?php echo htmlspecialchars($row['name']); ?></td>
+                                                <td><?php echo htmlspecialchars($row['model']); ?></td>
+                                                <td><?php echo htmlspecialchars($row['license_plate']); ?></td>
+                                                <td><?php echo htmlspecialchars($row['capacity']); ?></td>
+                                                <td><?php echo htmlspecialchars($row['fuel_type']); ?></td>
+                                                <td><?php echo htmlspecialchars($row['price_per_day']); ?> MWK</td>
+                                                <td><span class="status status-<?php echo strtolower($row['status']); ?>"><?php echo htmlspecialchars($row['status']); ?></span></td>
+                                            <?php endif; ?>
+                                        </tr>
+                                    <?php endforeach; ?>
+                                </tbody>
+                            </table>
+                        <?php endif; ?>
+                    <?php endif; ?>
                 </div>
             </div>
         </div>
@@ -750,6 +920,9 @@ $bookings = $bookingsStmt->fetchAll();
             const sections = document.querySelectorAll('.section');
             sections.forEach(section => section.classList.remove('active'));
             document.getElementById(sectionId).classList.add('active');
+            if (sectionId === 'reports') {
+                document.getElementById('reportType').value = '<?php echo htmlspecialchars($report_type); ?>';
+            }
         }
 
         // Modal functions
@@ -796,6 +969,27 @@ $bookings = $bookingsStmt->fetchAll();
             const search = document.getElementById('bookingSearch').value;
             const filter = document.getElementById('bookingFilter').value;
             window.location.href = `admin_dashboard.php?section=manage-bookings&search=${encodeURIComponent(search)}&filter=${filter}`;
+        }
+
+        // Report generation
+        function generateReport() {
+            const reportType = document.getElementById('reportType').value;
+            const search = document.getElementById('reportSearch')?.value || '';
+            if (reportType) {
+                window.location.href = `admin_dashboard.php?section=reports&report_type=${reportType}&search=${encodeURIComponent(search)}`;
+            } else {
+                alert('Please select a report type.');
+            }
+        }
+
+        // Download National ID
+        function downloadNationalId(base64Data, filename) {
+            const link = document.createElement('a');
+            link.href = `data:application/pdf;base64,${base64Data}`;
+            link.download = `national_id_${filename}.pdf`;
+            document.body.appendChild(link);
+            link.click();
+            document.body.removeChild(link);
         }
 
         // Logout function

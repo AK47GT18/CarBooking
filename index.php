@@ -136,7 +136,6 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_POST['signup'])) {
     $gender = $_POST['gender'];
     $address = $_POST['address'];
     $location = $_POST['location'];
-    $national_id = $_FILES['national_id']['name'];
     $kin_name = $_POST['kin_name'];
     $kin_relationship = $_POST['kin_relationship'];
     $kin_phone = $_POST['kin_phone'];
@@ -146,37 +145,45 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_POST['signup'])) {
         $error = "Invalid phone number format. Use +265 followed by 9 digits.";
     } elseif (!preg_match('/^\+265[0-9]{9}$/', $kin_phone)) {
         $error = "Invalid next of kin phone number format. Use +265 followed by 9 digits.";
+    } elseif (!isset($_FILES['national_id']) || $_FILES['national_id']['error'] !== UPLOAD_ERR_OK) {
+        $error = "National ID upload failed.";
     } else {
-        // Upload national ID
-        $target_dir = "Uploads/";
-        $target_file = $target_dir . basename($_FILES['national_id']['name']);
-        move_uploaded_file($_FILES['national_id']['tmp_name'], $target_file);
-
-        // Insert user with pending status
-        $stmt = $pdo->prepare("INSERT INTO users (email, phone, password, gender, address, location, national_id, status, payment_status) VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', 'pending')");
-        $stmt->execute([$email, $phone, $password, $gender, $address, $location, $national_id]);
-
-        $user_id = $pdo->lastInsertId();
-
-        // Insert next of kin
-        $stmt = $pdo->prepare("INSERT INTO next_of_kin (user_id, name, relationship, phone) VALUES (?, ?, ?, ?)");
-        $stmt->execute([$user_id, $kin_name, $kin_relationship, $kin_phone]);
-
-        // Initiate USSD payment for signup (500 Kwacha)
-        $payment = initiateUSSDPayment($pdo, $user_id, 500, 'signup');
-        if (isset($payment['error'])) {
-            $error = $payment['error'];
-            $pdo->prepare("DELETE FROM users WHERE id = ?")->execute([$user_id]);
-            $pdo->prepare("DELETE FROM next_of_kin WHERE user_id = ?")->execute([$user_id]);
+        // Validate and convert National ID PDF to Base64
+        $national_id_file = $_FILES['national_id'];
+        if ($national_id_file['type'] !== 'application/pdf') {
+            $error = "National ID must be a PDF file.";
         } else {
-            // Notify admin
-            $adminStmt = $pdo->query("SELECT email FROM admins");
-            while ($admin = $adminStmt->fetch()) {
-                sendEmail($admin['email'], "New User Signup", "A new user ($email) has signed up and initiated payment (tx_ref: {$payment['tx_ref']}).");
+            $national_id_base64 = base64_encode(file_get_contents($national_id_file['tmp_name']));
+            if (!$national_id_base64) {
+                $error = "Failed to process National ID file.";
+            } else {
+                // Insert user with pending status
+                $stmt = $pdo->prepare("INSERT INTO users (email, phone, password, gender, address, location, national_id, status, payment_status) VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', 'pending')");
+                $stmt->execute([$email, $phone, $password, $gender, $address, $location, $national_id_base64]);
+
+                $user_id = $pdo->lastInsertId();
+
+                // Insert next of kin
+                $stmt = $pdo->prepare("INSERT INTO next_of_kin (user_id, name, relationship, phone) VALUES (?, ?, ?, ?)");
+                $stmt->execute([$user_id, $kin_name, $kin_relationship, $kin_phone]);
+
+                // Initiate USSD payment for signup (500 Kwacha)
+                $payment = initiateUSSDPayment($pdo, $user_id, 500, 'signup');
+                if (isset($payment['error'])) {
+                    $error = $payment['error'];
+                    $pdo->prepare("DELETE FROM users WHERE id = ?")->execute([$user_id]);
+                    $pdo->prepare("DELETE FROM next_of_kin WHERE user_id = ?")->execute([$user_id]);
+                } else {
+                    // Notify admin
+                    $adminStmt = $pdo->query("SELECT email FROM admins");
+                    while ($admin = $adminStmt->fetch()) {
+                        sendEmail($admin['email'], "New User Signup", "A new user ($email) has signed up and initiated payment (tx_ref: {$payment['tx_ref']}).");
+                    }
+                    $_SESSION['pending_tx_ref'] = $payment['tx_ref'];
+                    header("Location: index.php?message=Signup initiated. Complete the USSD payment on your phone and verify.");
+                    exit;
+                }
             }
-            $_SESSION['pending_tx_ref'] = $payment['tx_ref'];
-            header("Location: index.php?message=Signup initiated. Complete the USSD payment on your phone and verify.");
-            exit;
         }
     }
 }
