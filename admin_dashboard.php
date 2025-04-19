@@ -5,10 +5,10 @@ require 'config.php';
 session_start();
 
 // Check if admin is logged in
-/* if (!isset($_SESSION['admin_id'])) {
+if (!isset($_SESSION['admin_id'])) {
     header("Location: admin_login.php");
     exit;
-}*/
+}
 
 // Function to verify PayChangu payment
 function verifyPayment($pdo, $tx_ref) {
