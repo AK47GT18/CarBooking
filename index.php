@@ -1003,7 +1003,7 @@ $availableCars = $availableCarsStmt->fetchAll();
     </div>
 
     <footer>
-        <p>© 2025 CarRental. All Rights Reserved.</p>
+        <p>© 2025 Mibesa. All Rights Reserved.</p>
     </footer>
 
     <script>
