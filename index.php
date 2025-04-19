@@ -834,7 +834,7 @@ $availableCars = $availableCarsStmt->fetchAll();
             <form id="signupForm" method="POST" enctype="multipart/form-data">
                 <div class="step" id="step1">
                     <h3>Step 1: Basic Information</h3>
-                    <label for="signupEmail">Email:</label><
+                    <label for="signupEmail">Email:</label>
                     <input type="email" id="signupEmail" name="email" required>
                     <span class="inline-error" id="signupEmailError">Valid email required</span>
                     <label for="phone">Phone Number (+265):</label>
