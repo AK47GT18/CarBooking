@@ -995,7 +995,7 @@ if ($report_type) {
     </div>
 
     <div class="footer">
-        <p>© 2025 CarRental. All rights reserved.</p>
+        <p>© 2025 Mibesa. All rights reserved.</p>
     </div>
 
     <script>
