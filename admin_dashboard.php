@@ -1,14 +1,12 @@
 <?php
 require 'config.php';
 
-// Start session
-session_start();
 
-// Check if admin is logged in
+/* Check if admin is logged in
 if (!isset($_SESSION['admin_id'])) {
     header("Location: admin_login.php");
     exit;
-}
+}*/
 
 // Function to verify PayChangu payment
 function verifyPayment($pdo, $tx_ref) {
@@ -354,7 +352,7 @@ $bookings = $bookingsStmt->fetchAll();
 </head>
 <body>
     <div class="sidebar" id="sidebar">
-        <h2>CarRental</h2>
+        <h2>MIBESA</h2>
         <div class="welcome-text">Welcome, Admin!</div>
         <ul>
             <li onclick="showSection('dashboard')"><i class="fas fa-home"></i> Dashboard</li>
@@ -390,7 +388,7 @@ $bookings = $bookingsStmt->fetchAll();
         <!-- Dashboard Section -->
         <div class="section <?php echo (!isset($_GET['section']) || $_GET['section'] == 'dashboard') ? 'active' : ''; ?>" id="dashboard">
             <div class="dashboard-header">
-                <h1>Admin Dashboard</h1>
+                <h1>Manager Dashboard</h1>
             </div>
             <div class="slider-container">
                 <div class="slider" id="dashboardSlider">
