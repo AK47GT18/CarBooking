@@ -1268,64 +1268,478 @@ $js_temp_booking_data = json_encode($temp_booking_data);
             <a href="#" aria-label="LinkedIn"><i class="fab fa-linkedin-in"></i></a>
         </div>
     </footer>
-    document.addEventListener('DOMContentLoaded', function() {
-    const modal = document.getElementById('myModal');
-    const closeBtn = document.getElementsByClassName('close')[0];
-    const paymentError = document.getElementById('paymentError');
-    const confirmBtn = document.getElementById('confirmBtn');
-    const cancelBtn = document.getElementById('cancelBtn');
-    const form = document.getElementById('paymentForm');
+    <script>
+  // Current date from PHP for date validation
+const currentDate = '<?php echo $current_date; ?>';
 
-    function showModal(message) {
-        paymentError.innerHTML = message;
-        modal.style.display = 'block';
+// Payment error handling variables from PHP
+const paymentError = <?php echo $js_payment_error; ?>;
+const paymentType = <?php echo $js_payment_type; ?>;
+const tempSignupData = <?php echo $js_temp_signup_data; ?>;
+const tempBookingData = <?php echo $js_temp_booking_data; ?>;
+
+// Handle payment failure and page load initialization
+window.addEventListener('load', () => {
+    // Show section based on URL parameter
+    const urlParams = new URLSearchParams(window.location.search);
+    const section = urlParams.get('section') || 'home';
+    showSection(section);
+
+    // Handle payment error if present
+    if (paymentError) {
+        // Display error message
+        const alertDiv = document.createElement('div');
+        alertDiv.className = 'alert';
+        alertDiv.textContent = paymentError;
+        document.body.insertBefore(alertDiv, document.querySelector('section'));
+
+        // Handle signup payment failure
+        if (paymentType === 'signup' && tempSignupData) {
+            // Populate signup form with temp data
+            document.getElementById('signupUsername').value = tempSignupData.username || '';
+            document.getElementById('signupEmail').value = tempSignupData.email || '';
+            document.getElementById('signupAge').value = tempSignupData.age || '';
+            document.getElementById('phone').value = tempSignupData.phone || '';
+            document.getElementById('gender').value = tempSignupData.gender || '';
+            document.getElementById('address').value = tempSignupData.address || '';
+            document.getElementById('location').value = tempSignupData.location || '';
+            document.getElementById('kin_name').value = tempSignupData.kin_name || '';
+            document.getElementById('kin_relationship').value = tempSignupData.kin_relationship || '';
+            document.getElementById('kin_phone').value = tempSignupData.kin_phone || '';
+
+            // Reset to step 1
+            document.querySelectorAll('.step').forEach(s => s.style.display = 'none');
+            document.getElementById('step1').style.display = 'block';
+            document.querySelectorAll('.progress-step').forEach(p => p.classList.remove('active'));
+            document.getElementById('progress1').classList.add('active');
+
+            // Clear file inputs (security restrictions prevent pre-filling)
+            document.getElementById('national_id').value = '';
+            document.getElementById('profile_picture').value = '';
+            document.getElementById('profilePicturePreview').style.display = 'none';
+
+            // Show signup modal
+            document.getElementById('signupModal').style.display = 'block';
+        } 
+        // Handle booking payment failure
+        else if (paymentType === 'booking' && tempBookingData) {
+            // Show booking section and populate form
+            showSection('booking');
+            const select = document.getElementById('bookingCarId');
+            for (let option of select.options) {
+                if (option.value == tempBookingData.car_id) {
+                    option.selected = true;
+                    break;
+                }
+            }
+            updatePricePerDay();
+            document.getElementById('pick_up_date').value = tempBookingData.pick_up_date || '';
+            document.getElementById('return_date').value = tempBookingData.return_date || '';
+            calculateTotalCost(
+                tempBookingData.pick_up_date,
+                tempBookingData.return_date,
+                parseFloat(tempBookingData.price_per_day)
+            );
+        }
+
+        // Auto-remove alert after 5 seconds
+        setTimeout(() => {
+            alertDiv.remove();
+        }, 5000);
     }
-
-    function hideModal() {
-        modal.style.display = 'none';
-    }
-
-    closeBtn.onclick = hideModal;
-    cancelBtn.onclick = hideModal;
-
-    window.onclick = function(event) {
-        if (event.target === modal) {
-            hideModal();
-        }
-    };
-
-    confirmBtn.onclick = function() {
-        hideModal();
-        alert('Payment successful!'); 
-        // Add real payment confirmation logic here
-    };
-
-    form.onsubmit = function(event) {
-        event.preventDefault();
-
-        const phoneInput = document.getElementById('phone').value.trim();
-        const amountInput = document.getElementById('amount').value.trim();
-
-        if (!phoneInput || !amountInput) {
-            showModal('Please fill in all fields.');
-            return;
-        }
-
-        const phonePattern = /^\d{10}$/;
-        if (!phonePattern.test(phoneInput)) {
-            showModal('Phone number must be exactly 10 digits.');
-            return;
-        }
-
-        const amount = parseFloat(amountInput);
-        if (isNaN(amount) || amount <= 0) {
-            showModal('Please enter a valid amount.');
-            return;
-        }
-
-        showModal(`You are about to pay MWK ${amount}. Confirm?`);
-    };
 });
+
+// Show specific section and hide others
+function showSection(sectionId) {
+    document.querySelectorAll('section').forEach(section => {
+        section.style.display = 'none';
+    });
+    document.getElementById(sectionId).style.display = 'block';
+    // Update URL without page reload
+    history.pushState(null, '', `?section=${sectionId}`);
+}
+
+// Modal close button handling
+document.querySelectorAll('.close').forEach(closeBtn => {
+    closeBtn.addEventListener('click', () => {
+        const modalId = closeBtn.getAttribute('data-target');
+        document.getElementById(modalId).style.display = 'none';
+    });
+});
+
+// Login and Signup modal toggling
+document.getElementById('loginBtn')?.addEventListener('click', () => {
+    document.getElementById('loginModal').style.display = 'block';
+    document.getElementById('signupModal').style.display = 'none';
+});
+
+document.getElementById('showSignup')?.addEventListener('click', () => {
+    document.getElementById('signupModal').style.display = 'block';
+    document.getElementById('loginModal').style.display = 'none';
+});
+
+document.getElementById('showLogin')?.addEventListener('click', () => {
+    document.getElementById('loginModal').style.display = 'block';
+    document.getElementById('signupModal').style.display = 'none';
+});
+
+// Signup Form Step Navigation
+function nextStep(step) {
+    if (validateStep(step - 1)) {
+        document.querySelectorAll('.step').forEach(s => s.style.display = 'none');
+        document.getElementById(`step${step}`).style.display = 'block';
+        document.querySelectorAll('.progress-step').forEach(p => p.classList.remove('active'));
+        document.getElementById(`progress${step}`).classList.add('active');
+    }
+}
+
+function prevStep(step) {
+    document.querySelectorAll('.step').forEach(s => s.style.display = 'none');
+    document.getElementById(`step${step}`).style.display = 'block';
+    document.querySelectorAll('.progress-step').forEach(p => p.classList.remove('active'));
+    document.getElementById(`progress${step}`).classList.add('active');
+}
+
+// Form Validation Utilities
+function showError(elementId, message) {
+    const errorElement = document.getElementById(elementId);
+    errorElement.textContent = message;
+    errorElement.style.display = 'block';
+    errorElement.setAttribute('aria-live', 'polite');
+}
+
+function hideError(elementId) {
+    const errorElement = document.getElementById(elementId);
+    errorElement.style.display = 'none';
+}
+
+// Validate Signup Form Steps
+function validateStep(step) {
+    let valid = true;
+
+    if (step === 1) {
+        const username = document.getElementById('signupUsername').value;
+        const email = document.getElementById('signupEmail').value;
+        const password = document.getElementById('signupPassword').value;
+        const confirmPassword = document.getElementById('confirmPassword').value;
+        const age = document.getElementById('signupAge').value;
+
+        if (!username || !/^[A-Za-z0-9_]{3,50}$/.test(username)) {
+            showError('signupUsernameError', 'Username must be 3-50 characters, using letters, numbers, or underscores.');
+            valid = false;
+        } else {
+            hideError('signupUsernameError');
+        }
+
+        if (!email || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+            showError('signupEmailError', 'Valid email required.');
+            valid = false;
+        } else {
+            hideError('signupEmailError');
+        }
+
+        if (!password || password.length < 8) {
+            showError('signupPasswordError', 'Password must be at least 8 characters.');
+            valid = false;
+        } else {
+            hideError('signupPasswordError');
+        }
+
+        if (password !== confirmPassword) {
+            showError('confirmPasswordError', 'Passwords do not match.');
+            valid = false;
+        } else {
+            hideError('confirmPasswordError');
+        }
+
+        if (!age || age < 18 || age > 100) {
+            showError('signupAgeError', 'Age must be between 18 and 100.');
+            valid = false;
+        } else {
+            hideError('signupAgeError');
+        }
+    } else if (step === 2) {
+        const phone = document.getElementById('phone').value;
+        const gender = document.getElementById('gender').value;
+        const address = document.getElementById('address').value;
+        const location = document.getElementById('location').value;
+
+        if (!phone || !/^0[0-9]{9}$/.test(phone)) {
+            showError('phoneError', 'Phone number must be 10 digits starting with 0 (e.g., 0885620896).');
+            valid = false;
+        } else {
+            hideError('phoneError');
+        }
+
+        if (!gender) {
+            showError('genderError', 'Please select a gender.');
+            valid = false;
+        } else {
+            hideError('genderError');
+        }
+
+        if (!address) {
+            showError('addressError', 'Address is required.');
+            valid = false;
+        } else {
+            hideError('addressError');
+        }
+
+        if (!location) {
+            showError('locationError', 'Please select a location.');
+            valid = false;
+        } else {
+            hideError('locationError');
+        }
+    } else if (step === 3) {
+        const kinName = document.getElementById('kin_name').value;
+        const kinRelationship = document.getElementById('kin_relationship').value;
+        const kinPhone = document.getElementById('kin_phone').value;
+
+        if (!kinName) {
+            showError('kinNameError', 'Full name is required.');
+            valid = false;
+        } else {
+            hideError('kinNameError');
+        }
+
+        if (!kinRelationship) {
+            showError('kinRelationshipError', 'Please select a relationship.');
+            valid = false;
+        } else {
+            hideError('kinRelationshipError');
+        }
+
+        if (!kinPhone || !/^0[0-9]{9}$/.test(kinPhone)) {
+            showError('kinPhoneError', 'Phone number must be 10 digits starting with 0 (e.g., 0885620896).');
+            valid = false;
+        } else {
+            hideError('kinPhoneError');
+        }
+    } else if (step === 4) {
+        const nationalId = document.getElementById('national_id').files[0];
+        const profilePicture = document.getElementById('profile_picture').files[0];
+
+        if (!nationalId || nationalId.type !== 'application/pdf' || nationalId.size > 2 * 1024 * 1024) {
+            showError('nationalIdError', 'A valid PDF document (max 2MB) is required.');
+            valid = false;
+        } else {
+            hideError('nationalIdError');
+        }
+
+        if (!profilePicture || !['image/jpeg', 'image/png'].includes(profilePicture.type) || profilePicture.size > 2 * 1024 * 1024) {
+            showError('profilePictureError', 'A valid image (JPEG/PNG, max 2MB) is required.');
+            valid = false;
+        } else {
+            hideError('profilePictureError');
+        }
+    }
+
+    return valid;
+}
+
+// Real-time validation for signup form
+document.getElementById('signupForm')?.querySelectorAll('input, select').forEach(input => {
+    input.addEventListener('input', () => {
+        const step = parseInt(input.closest('.step').id.replace('step', ''));
+        validateStep(step);
+    });
+});
+
+// Profile picture preview
+document.getElementById('profile_picture')?.addEventListener('change', function(e) {
+    const file = e.target.files[0];
+    const preview = document.getElementById('profilePicturePreview');
+    if (file && ['image/jpeg', 'image/png'].includes(file.type)) {
+        const reader = new FileReader();
+        reader.onload = function(e) {
+            preview.src = e.target.result;
+            preview.style.display = 'block';
+        };
+        reader.readAsDataURL(file);
+    } else {
+        preview.style.display = 'none';
+    }
+});
+
+// Booking Form Handling
+function updatePricePerDay() {
+    const select = document.getElementById('bookingCarId');
+    const carNameInput = document.getElementById('carName');
+    const priceInput = document.getElementById('pricePerDay');
+    const totalCostInput = document.getElementById('totalCost');
+    const pickUpDate = document.getElementById('pick_up_date').value;
+    const returnDate = document.getElementById('return_date').value;
+
+    const selectedOption = select.options[select.selectedIndex];
+    if (selectedOption.value) {
+        carNameInput.value = selectedOption.getAttribute('data-name');
+        priceInput.value = selectedOption.getAttribute('data-price');
+        calculateTotalCost(pickUpDate, returnDate, parseFloat(priceInput.value));
+    } else {
+        carNameInput.value = '';
+        priceInput.value = '';
+        totalCostInput.value = '';
+    }
+}
+
+function calculateTotalCost(pickUpDate, returnDate, pricePerDay) {
+    if (pickUpDate && returnDate && pricePerDay) {
+        const pickUp = new Date(pickUpDate);
+        const returnD = new Date(returnDate);
+        const diffTime = returnD - pickUp;
+        const diffDays = Math.ceil(diffTime / (1000 * 60 * 60 * 24));
+        if (diffDays > 0) {
+            const totalCost = diffDays * pricePerDay;
+            document.getElementById('totalCost').value = totalCost.toFixed(2) + ' Kwacha';
+        } else {
+            document.getElementById('totalCost').value = '';
+        }
+    }
+}
+
+// Validate Booking Form
+document.getElementById('newBookingForm')?.addEventListener('submit', function(e) {
+    const carId = document.getElementById('bookingCarId').value;
+    const pickUpDate = document.getElementById('pick_up_date').value;
+    const returnDate = document.getElementById('return_date').value;
+    let valid = true;
+
+    if (!carId) {
+        showError('bookingCarIdError', 'Please select a car.');
+        valid = false;
+    } else {
+        hideError('bookingCarIdError');
+    }
+
+    if (!pickUpDate || new Date(pickUpDate) < new Date(currentDate)) {
+        showError('pickUpDateError', 'Pick-up date must be today or later.');
+        valid = false;
+    } else {
+        hideError('pickUpDateError');
+    }
+
+    if (!returnDate || new Date(returnDate) <= new Date(pickUpDate)) {
+        showError('returnDateError', 'Return date must be after pick-up date.');
+        valid = false;
+    } else {
+        hideError('returnDateError');
+    }
+
+    if (!valid) {
+        e.preventDefault();
+    }
+});
+
+// Update total cost on date changes
+document.getElementById('pick_up_date')?.addEventListener('change', updatePricePerDay);
+document.getElementById('return_date')?.addEventListener('change', updatePricePerDay);
+
+// Contact Form Validation
+document.getElementById('contactForm')?.addEventListener('submit', function(e) {
+    const email = document.getElementById('contact_email').value;
+    const message = document.getElementById('contact_message').value;
+    let valid = true;
+
+    if (!email || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+        showError('emailError', 'Valid email required.');
+        valid = false;
+    } else {
+        hideError('emailError');
+    }
+
+    if (!message) {
+        showError('messageError', 'Message is required.');
+        valid = false;
+    } else {
+        hideError('messageError');
+    }
+
+    if (!valid) {
+        e.preventDefault();
+    }
+});
+
+// Filter Bookings in Bookings Section
+function filterBookings() {
+    const search = document.getElementById('bookingSearch').value.toLowerCase();
+    const status = document.getElementById('bookingStatusFilter').value.toLowerCase();
+    const rows = document.querySelectorAll('#bookingsTable tbody tr');
+
+    rows.forEach(row => {
+        const car = row.cells[0].textContent.toLowerCase();
+        const bookingId = row.cells[1].textContent.toLowerCase();
+        const rowStatus = row.cells[4].textContent.toLowerCase();
+
+        const matchesSearch = car.includes(search) || bookingId.includes(search);
+        const matchesStatus = !status || rowStatus === status;
+
+        row.style.display = matchesSearch && matchesStatus ? '' : 'none';
+    });
+}
+
+function resetBookingFilter() {
+    document.getElementById('bookingSearch').value = '';
+    document.getElementById('bookingStatusFilter').value = '';
+    filterBookings();
+}
+
+// Filter Bookings in Profile Section
+function filterProfileBookings() {
+    const search = document.getElementById('profileBookingSearch').value.toLowerCase();
+    const status = document.getElementById('profileBookingStatusFilter').value.toLowerCase();
+    const rows = document.querySelectorAll('#profileBookingsTable tbody tr');
+
+    rows.forEach(row => {
+        const car = row.cells[0].textContent.toLowerCase();
+        const rowStatus = row.cells[3].textContent.toLowerCase();
+
+        const matchesSearch = car.includes(search);
+        const matchesStatus = !status || rowStatus === status;
+
+        row.style.display = matchesSearch && matchesStatus ? '' : 'none';
+    });
+}
+
+function resetProfileBookingFilter() {
+    document.getElementById('profileBookingSearch').value = '';
+    document.getElementById('profileBookingStatusFilter').value = '';
+    filterProfileBookings();
+}
+
+// Show Edit Profile Modal
+function showEditProfileModal() {
+    document.getElementById('editProfileModal').style.display = 'block';
+}
+
+// Show Booking Modal from Car Card
+function showBookingModal(carId, carName, pricePerDay) {
+    showSection('booking');
+    const select = document.getElementById('bookingCarId');
+    for (let option of select.options) {
+        if (option.value == carId) {
+            option.selected = true;
+            break;
+        }
+    }
+    updatePricePerDay();
+}
+
+// Slider Functionality
+let slideIndex = 0;
+function showSlides() {
+    const slides = document.querySelector('.slides');
+    const totalSlides = document.querySelectorAll('.slide').length;
+    slideIndex = (slideIndex >= totalSlides) ? 0 : slideIndex < 0 ? totalSlides - 1 : slideIndex;
+    slides.style.transform = `translateX(-${slideIndex * 100}%)`;
+    setTimeout(() => {
+        slideIndex++;
+        showSlides();
+    }, 5000);
+}
+
+// Initialize slider
+showSlides();
 </script>
 </body>
 </html>
