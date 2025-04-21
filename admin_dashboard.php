@@ -1,68 +1,36 @@
 <?php
 require 'config.php';
-
-// Check if admin is logged in
-// (Assuming admin session check logic is in config.php or elsewhere)
-
-// Function to verify PayChangu payment
-function verifyPayment($pdo, $tx_ref) {
-    $ch = curl_init();
-    curl_setopt($ch, CURLOPT_URL, PAYCHANGU_API_URL . "/verify-payment/$tx_ref");
-    curl_setopt($ch, CURLOPT_HTTPGET, 1);
-    curl_setopt($ch, CURLOPT_HTTPHEADER, [
-        'Accept: application/json',
-        'Authorization: Bearer ' . PAYCHANGU_SECRET_KEY
-    ]);
-    curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
-    $response = curl_exec($ch);
-    $http_code = curl_getinfo($ch, CURLINFO_HTTP_CODE);
-    curl_close($ch);
-
-    if ($http_code == 200) {
-        $result = json_decode($response, true);
-        if ($result['status'] == 'success' && $result['data']['status'] == 'success') {
-            // Update payment status
-            $stmt = $pdo->prepare("UPDATE payments SET status = 'success' WHERE tx_ref = ?");
-            $stmt->execute([$tx_ref]);
-
-            // Check payment type
-            $stmt = $pdo->prepare("SELECT user_id, booking_id, type FROM payments WHERE tx_ref = ?");
-            $stmt->execute([$tx_ref]);
-            $payment = $stmt->fetch();
-
-            if ($payment['type'] == 'signup') {
-                $stmt = $pdo->prepare("UPDATE users SET payment_status = 'paid', has_paid = 1 WHERE id = ?");
-                $stmt->execute([$payment['user_id']]);
-            } elseif ($payment['type'] == 'booking') {
-                $stmt = $pdo->prepare("UPDATE bookings SET payment_status = 'paid', status = 'booked' WHERE id = ?");
-                $stmt->execute([$payment['booking_id']]);
-                $stmt = $pdo->prepare("UPDATE cars SET status = 'booked' WHERE id = (SELECT car_id FROM bookings WHERE id = ?)");
-                $stmt->execute([$payment['booking_id']]);
-            }
-
-            // Notify admin
-            $adminStmt = $pdo->query("SELECT email FROM admins");
-            while ($admin = $adminStmt->fetch()) {
-                sendEmail($admin['email'], "Payment Confirmed", "Payment (tx_ref: $tx_ref, Type: {$payment['type']}) confirmed.");
-            }
-            return ['success' => true, 'message' => 'Payment verified successfully'];
-        }
-    }
-    return ['success' => false, 'message' => 'Payment not yet confirmed or failed'];
+if (session_status() === PHP_SESSION_NONE) {
+    session_start();
 }
 
-// Handle payment verification
-if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_POST['verify_payment'])) {
-    $tx_ref = $_POST['tx_ref'];
-    $verification = verifyPayment($pdo, $tx_ref);
-    header("Location: admin_dashboard.php?section=manage-" . ($_POST['type'] == 'signup' ? 'users' : 'bookings') . "&message=" . urlencode($verification['message']));
-    exit;
+// CSRF Token Functions
+function generate_csrf_token() {
+    if (empty($_SESSION['csrf_token'])) {
+        $_SESSION['csrf_token'] = bin2hex(random_bytes(32));
+    }
+    return $_SESSION['csrf_token'];
+}
+
+function verify_csrf_token($token) {
+    return isset($_SESSION['csrf_token']) && hash_equals($_SESSION['csrf_token'], $token);
 }
 
 // Handle user approval/decline
 if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_POST['user_action'])) {
+    if (!isset($_SESSION['admin_id'])) {
+        header("Location: admin_dashboard.php?error=" . urlencode("Please log in to perform this action"));
+        exit;
+    }
     $user_id = $_POST['user_id'];
     $action = $_POST['action'];
+    $csrf_token = $_POST['csrf_token'];
+    $rejection_reason = isset($_POST['rejection_reason']) ? trim($_POST['rejection_reason']) : '';
+
+    if (!verify_csrf_token($csrf_token)) {
+        header("Location: admin_dashboard.php?section=manage-users&error=" . urlencode("Invalid CSRF token"));
+        exit;
+    }
 
     $stmt = $pdo->prepare("UPDATE users SET status = ? WHERE id = ?");
     $stmt->execute([$action, $user_id]);
@@ -70,18 +38,40 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_POST['user_action'])) {
     $stmt = $pdo->prepare("SELECT email FROM users WHERE id = ?");
     $stmt->execute([$user_id]);
     $user = $stmt->fetch();
+    
     $message = $action == 'approved' 
         ? "Your CarRental account has been approved. You can now log in and book cars."
-        : "Your CarRental account has been declined. Please contact support for more information.";
+        : "Your CarRental account has been declined. Reason: $rejection_reason. Please contact support for more information.";
     sendEmail($user['email'], "Account Status Update", $message);
 
-    header("Location: admin_dashboard.php?section=manage-users");
+    header("Location: admin_dashboard.php?section=manage-users&message=" . urlencode("User $action successfully"));
     exit;
 }
 
 // Handle user deletion
 if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_POST['delete_user'])) {
+    if (!isset($_SESSION['admin_id'])) {
+        header("Location: admin_dashboard.php?error=" . urlencode("Please log in to perform this action"));
+        exit;
+    }
     $user_id = $_POST['user_id'];
+    $csrf_token = $_POST['csrf_token'];
+
+    if (!verify_csrf_token($csrf_token)) {
+        header("Location: admin_dashboard.php?section=manage-users&error=" . urlencode("Invalid CSRF token"));
+        exit;
+    }
+
+    // Check for dependent payments
+    $stmt = $pdo->prepare("SELECT COUNT(*) FROM payments WHERE user_id = ?");
+    $stmt->execute([$user_id]);
+    $payment_count = $stmt->fetchColumn();
+
+    if ($payment_count > 0) {
+        header("Location: admin_dashboard.php?section=manage-users&error=" . urlencode("Cannot delete user: they have associated payments."));
+        exit;
+    }
+
     $stmt = $pdo->prepare("SELECT email FROM users WHERE id = ?");
     $stmt->execute([$user_id]);
     $user = $stmt->fetch();
@@ -91,12 +81,16 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_POST['delete_user'])) {
 
     sendEmail($user['email'], "Account Deletion Notification", "Your CarRental account has been deleted by an administrator. Contact support if this was an error.");
 
-    header("Location: admin_dashboard.php?section=manage-users");
+    header("Location: admin_dashboard.php?section=manage-users&message=" . urlencode("User deleted successfully"));
     exit;
 }
 
 // Handle user update
 if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_POST['update_user'])) {
+    if (!isset($_SESSION['admin_id'])) {
+        header("Location: admin_dashboard.php?error=" . urlencode("Please log in to perform this action"));
+        exit;
+    }
     $user_id = $_POST['user_id'];
     $email = trim($_POST['email']);
     $phone = trim($_POST['phone']);
@@ -107,14 +101,21 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_POST['update_user'])) {
     $kin_relationship = trim($_POST['kin_relationship']);
     $kin_phone = trim($_POST['kin_phone']);
     $status = $_POST['status'];
+    $username = trim($_POST['username']);
+    $age = $_POST['age'];
+    $csrf_token = $_POST['csrf_token'];
 
-    // Basic validation
+    if (!verify_csrf_token($csrf_token)) {
+        header("Location: admin_dashboard.php?section=manage-users&error=" . urlencode("Invalid CSRF token"));
+        exit;
+    }
+
     $errors = [];
     if (empty($email) || !filter_var($email, FILTER_VALIDATE_EMAIL)) {
         $errors[] = "A valid email is required.";
     }
-    if (empty($phone)) {
-        $errors[] = "Phone number is required.";
+    if (empty($phone) || !preg_match('/^0[0-9]{9}$/', $phone)) {
+        $errors[] = "Phone number must be 10 digits starting with 0.";
     }
     if (empty($gender) || !in_array($gender, ['Male', 'Female', 'Other'])) {
         $errors[] = "Valid gender is required.";
@@ -128,12 +129,17 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_POST['update_user'])) {
     if (empty($status) || !in_array($status, ['pending', 'approved', 'declined'])) {
         $errors[] = "Valid status is required.";
     }
+    if (empty($username)) {
+        $errors[] = "Username is required.";
+    }
+    if (empty($age) || $age < 18) {
+        $errors[] = "Age must be 18 or older.";
+    }
 
     if (empty($errors)) {
-        $stmt = $pdo->prepare("UPDATE users SET email = ?, phone = ?, gender = ?, address = ?, location = ?, kin_name = ?, kin_relationship = ?, kin_phone = ?, status = ? WHERE id = ?");
-        $stmt->execute([$email, $phone, $gender, $address, $location, $kin_name, $kin_relationship, $kin_phone, $status, $user_id]);
+        $stmt = $pdo->prepare("UPDATE users SET email = ?, phone = ?, gender = ?, address = ?, location = ?, kin_name = ?, kin_relationship = ?, kin_phone = ?, status = ?, username = ?, age = ? WHERE id = ?");
+        $stmt->execute([$email, $phone, $gender, $address, $location, $kin_name, $kin_relationship, $kin_phone, $status, $username, $age, $user_id]);
 
-        // Notify user
         sendEmail($email, "Profile Updated", "Your CarRental account details have been updated by an administrator.");
 
         header("Location: admin_dashboard.php?section=manage-users&message=" . urlencode("User updated successfully"));
@@ -146,6 +152,10 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_POST['update_user'])) {
 
 // Handle car addition
 if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_POST['add_car'])) {
+    if (!isset($_SESSION['admin_id'])) {
+        header("Location: admin_dashboard.php?error=" . urlencode("Please log in to perform this action"));
+        exit;
+    }
     $name = $_POST['name'];
     $model = $_POST['model'];
     $license_plate = $_POST['license_plate'];
@@ -153,11 +163,17 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_POST['add_car'])) {
     $fuel_type = $_POST['fuel_type'];
     $price_per_day = $_POST['price_per_day'];
     $featured = isset($_POST['featured']) ? 1 : 0;
+    $csrf_token = $_POST['csrf_token'];
 
-    $imageBase64 = '';
+    if (!verify_csrf_token($csrf_token)) {
+        header("Location: admin_dashboard.php?section=manage-cars&error=" . urlencode("Invalid CSRF token"));
+        exit;
+    }
+
+    $imageBase64 = NULL;
     if (isset($_FILES['image']) && $_FILES['image']['error'] === UPLOAD_ERR_OK) {
         $allowedTypes = ['image/jpeg', 'image/png', 'image/gif', 'image/bmp', 'image/webp'];
-        $maxSize = 5 * 1024 * 1024; // 5MB
+        $maxSize = 5 * 1024 * 1024;
         $fileType = $_FILES['image']['type'];
         $fileSize = $_FILES['image']['size'];
 
@@ -165,19 +181,24 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_POST['add_car'])) {
             $imageData = file_get_contents($_FILES['image']['tmp_name']);
             $imageBase64 = 'data:' . $fileType . ';base64,' . base64_encode($imageData);
         } else {
-            error_log("Invalid file type or size: Type=$fileType, Size=$fileSize");
+            header("Location: admin_dashboard.php?section=manage-cars&error=" . urlencode("Invalid image type or size"));
+            exit;
         }
     }
 
     $stmt = $pdo->prepare("INSERT INTO cars (name, model, license_plate, capacity, fuel_type, price_per_day, featured, image) VALUES (?, ?, ?, ?, ?, ?, ?, ?)");
     $stmt->execute([$name, $model, $license_plate, $capacity, $fuel_type, $price_per_day, $featured, $imageBase64]);
 
-    header("Location: admin_dashboard.php?section=manage-cars");
+    header("Location: admin_dashboard.php?section=manage-cars&message=" . urlencode("Car added successfully"));
     exit;
 }
 
 // Handle car update
 if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_POST['update_car'])) {
+    if (!isset($_SESSION['admin_id'])) {
+        header("Location: admin_dashboard.php?error=" . urlencode("Please log in to perform this action"));
+        exit;
+    }
     $car_id = $_POST['car_id'];
     $name = $_POST['name'];
     $model = $_POST['model'];
@@ -186,10 +207,16 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_POST['update_car'])) {
     $fuel_type = $_POST['fuel_type'];
     $price_per_day = $_POST['price_per_day'];
     $featured = isset($_POST['featured']) ? 1 : 0;
+    $csrf_token = $_POST['csrf_token'];
+
+    if (!verify_csrf_token($csrf_token)) {
+        header("Location: admin_dashboard.php?section=manage-cars&error=" . urlencode("Invalid CSRF token"));
+        exit;
+    }
 
     if (isset($_FILES['image']) && $_FILES['image']['error'] === UPLOAD_ERR_OK) {
         $allowedTypes = ['image/jpeg', 'image/png', 'image/gif', 'image/bmp', 'image/webp'];
-        $maxSize = 5 * 1024 * 1024; // 5MB
+        $maxSize = 5 * 1024 * 1024;
         $fileType = $_FILES['image']['type'];
         $fileSize = $_FILES['image']['size'];
 
@@ -199,32 +226,52 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_POST['update_car'])) {
             $stmt = $pdo->prepare("UPDATE cars SET name = ?, model = ?, license_plate = ?, capacity = ?, fuel_type = ?, price_per_day = ?, featured = ?, image = ? WHERE id = ?");
             $stmt->execute([$name, $model, $license_plate, $capacity, $fuel_type, $price_per_day, $featured, $imageBase64, $car_id]);
         } else {
-            error_log("Invalid file type or size: Type=$fileType, Size=$fileSize");
-            $stmt = $pdo->prepare("UPDATE cars SET name = ?, model = ?, license_plate = ?, capacity = ?, fuel_type = ?, price_per_day = ?, featured = ? WHERE id = ?");
-            $stmt->execute([$name, $model, $license_plate, $capacity, $fuel_type, $price_per_day, $featured, $car_id]);
+            header("Location: admin_dashboard.php?section=manage-cars&error=" . urlencode("Invalid image type or size"));
+            exit;
         }
     } else {
         $stmt = $pdo->prepare("UPDATE cars SET name = ?, model = ?, license_plate = ?, capacity = ?, fuel_type = ?, price_per_day = ?, featured = ? WHERE id = ?");
         $stmt->execute([$name, $model, $license_plate, $capacity, $fuel_type, $price_per_day, $featured, $car_id]);
     }
 
-    header("Location: admin_dashboard.php?section=manage-cars");
+    header("Location: admin_dashboard.php?section=manage-cars&message=" . urlencode("Car updated successfully"));
     exit;
 }
 
 // Handle car deletion
 if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_POST['delete_car'])) {
+    if (!isset($_SESSION['admin_id'])) {
+        header("Location: admin_dashboard.php?error=" . urlencode("Please log in to perform this action"));
+        exit;
+    }
     $car_id = $_POST['car_id'];
+    $csrf_token = $_POST['csrf_token'];
+
+    if (!verify_csrf_token($csrf_token)) {
+        header("Location: admin_dashboard.php?section=manage-cars&error=" . urlencode("Invalid CSRF token"));
+        exit;
+    }
+
     $stmt = $pdo->prepare("DELETE FROM cars WHERE id = ?");
     $stmt->execute([$car_id]);
-    header("Location: admin_dashboard.php?section=manage-cars");
+    header("Location: admin_dashboard.php?section=manage-cars&message=" . urlencode("Car deleted successfully"));
     exit;
 }
 
 // Handle booking approval/decline
-if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_POST['booking_action'])) {
+if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_POST['booking_id'], $_POST['action'], $_POST['csrf_token'])) {
+    if (!isset($_SESSION['admin_id'])) {
+        header("Location: admin_dashboard.php?error=" . urlencode("Please log in to perform this action"));
+        exit;
+    }
     $booking_id = $_POST['booking_id'];
     $action = $_POST['action'];
+    $csrf_token = $_POST['csrf_token'];
+
+    if (!verify_csrf_token($csrf_token)) {
+        header("Location: admin_dashboard.php?section=manage-bookings&error=" . urlencode("Invalid CSRF token"));
+        exit;
+    }
 
     $stmt = $pdo->prepare("UPDATE bookings SET status = ? WHERE id = ?");
     $stmt->execute([$action, $booking_id]);
@@ -238,25 +285,38 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_POST['booking_action'])) {
         : "Your booking has been cancelled. Please contact support for more information.";
     sendEmail($booking['email'], "Booking Status Update", $message);
 
-    if ($action == 'cancelled') {
+    if ($action == 'booked') {
+        $stmt = $pdo->prepare("UPDATE cars SET status = 'booked' WHERE id = ?");
+        $stmt->execute([$booking['car_id']]);
+    } elseif ($action == 'cancelled') {
         $stmt = $pdo->prepare("UPDATE cars SET status = 'available' WHERE id = ?");
         $stmt->execute([$booking['car_id']]);
     }
 
-    header("Location: admin_dashboard.php?section=manage-bookings");
+    header("Location: admin_dashboard.php?section=manage-bookings&message=" . urlencode("Booking $action successfully"));
     exit;
 }
+
+// Fetch dashboard statistics
+$customer_count = $pdo->query("SELECT COUNT(*) FROM users")->fetchColumn();
+$car_count = $pdo->query("SELECT COUNT(*) FROM cars")->fetchColumn();
+$booking_count = $pdo->query("SELECT COUNT(*) FROM bookings")->fetchColumn();
+$recent_bookings = $pdo->query("SELECT b.*, u.email AS customer, c.name AS car_name 
+                                FROM bookings b 
+                                JOIN users u ON b.user_id = u.id 
+                                JOIN cars c ON b.car_id = c.id 
+                                ORDER BY b.created_at DESC 
+                                LIMIT 5")->fetchAll();
 
 // Fetch data with search and filter
 $search = isset($_GET['search']) ? trim($_GET['search']) : '';
 $filter = isset($_GET['filter']) ? $_GET['filter'] : 'all';
 
-// Users with signup payments
-$usersQuery = "SELECT u.*, p.status AS payment_status, p.amount AS payment_amount, p.tx_ref 
+// Users
+$usersQuery = "SELECT u.* 
                FROM users u 
-               LEFT JOIN payments p ON u.id = p.user_id AND p.type = 'signup' 
-               WHERE u.email LIKE ? OR u.address LIKE ? OR u.location LIKE ? OR u.kin_name LIKE ? OR u.kin_phone LIKE ?";
-$usersParams = ["%$search%", "%$search%", "%$search%", "%$search%", "%$search%"];
+               WHERE u.email LIKE ? OR u.address LIKE ? OR u.location LIKE ? OR u.kin_name LIKE ? OR u.kin_phone LIKE ? OR u.username LIKE ?";
+$usersParams = ["%$search%", "%$search%", "%$search%", "%$search%", "%$search%", "%$search%"];
 if ($filter != 'all') {
     $usersQuery .= " AND u.status = ?";
     $usersParams[] = $filter;
@@ -277,11 +337,10 @@ $carsStmt->execute($carsParams);
 $cars = $carsStmt->fetchAll();
 
 // Bookings
-$bookingsQuery = "SELECT b.*, u.email AS customer, c.name AS car_name, p.status AS payment_status, p.amount AS payment_amount, p.tx_ref 
+$bookingsQuery = "SELECT b.*, u.email AS customer, c.name AS car_name 
                  FROM bookings b 
                  JOIN users u ON b.user_id = u.id 
                  JOIN cars c ON b.car_id = c.id 
-                 LEFT JOIN payments p ON b.id = p.booking_id 
                  WHERE b.booking_id LIKE ? OR u.email LIKE ? OR c.name LIKE ?";
 $bookingsParams = ["%$search%", "%$search%", "%$search%"];
 if ($filter != 'all') {
@@ -292,28 +351,41 @@ $bookingsStmt = $pdo->prepare($bookingsQuery);
 $bookingsStmt->execute($bookingsParams);
 $bookings = $bookingsStmt->fetchAll();
 
+// Extra Charges
+$extraChargesQuery = "SELECT e.*, b.booking_id 
+                     FROM extra_charges e 
+                     JOIN bookings b ON e.booking_id = b.id 
+                     WHERE b.booking_id LIKE ?";
+$extraChargesParams = ["%$search%"];
+$extraChargesStmt = $pdo->prepare($extraChargesQuery);
+$extraChargesStmt->execute($extraChargesParams);
+$extra_charges = $extraChargesStmt->fetchAll();
+
+// Payments
+$paymentsQuery = "SELECT p.*, u.email AS user_email, b.booking_id 
+                 FROM payments p 
+                 LEFT JOIN users u ON p.user_id = u.id 
+                 LEFT JOIN bookings b ON p.booking_id = b.id 
+                 WHERE p.tx_ref LIKE ? OR p.charge_id LIKE ?";
+$paymentsParams = ["%$search%", "%$search%"];
+$paymentsStmt = $pdo->prepare($paymentsQuery);
+$paymentsStmt->execute($paymentsParams);
+$payments = $paymentsStmt->fetchAll();
+
 // Reports
 $report_type = isset($_GET['report_type']) ? $_GET['report_type'] : '';
 $report_data = [];
 if ($report_type) {
     switch ($report_type) {
         case 'users':
-            $stmt = $pdo->prepare("SELECT u.email, u.phone, u.gender, u.address, u.location, u.kin_name, u.kin_relationship, u.kin_phone, u.status, u.payment_status 
+            $stmt = $pdo->prepare("SELECT u.username, u.email, u.phone, u.gender, u.address, u.location, u.kin_name, u.kin_relationship, u.kin_phone, u.status, u.age 
                                    FROM users u 
-                                   WHERE u.email LIKE ? OR u.address LIKE ? OR u.location LIKE ? OR u.kin_name LIKE ? OR u.kin_phone LIKE ?");
-            $stmt->execute(["%$search%", "%$search%", "%$search%", "%$search%", "%$search%"]);
-            $report_data = $stmt->fetchAll();
-            break;
-        case 'payments':
-            $stmt = $pdo->prepare("SELECT p.tx_ref, p.amount, p.status, p.type, u.email, u.gender 
-                                   FROM payments p 
-                                   LEFT JOIN users u ON p.user_id = u.id 
-                                   WHERE p.tx_ref LIKE ? OR u.email LIKE ?");
-            $stmt->execute(["%$search%", "%$search%"]);
+                                   WHERE u.email LIKE ? OR u.address LIKE ? OR u.location LIKE ? OR u.kin_name LIKE ? OR u.kin_phone LIKE ? OR u.username LIKE ?");
+            $stmt->execute(["%$search%", "%$search%", "%$search%", "%$search%", "%$search%", "%$search%"]);
             $report_data = $stmt->fetchAll();
             break;
         case 'bookings':
-            $stmt = $pdo->prepare("SELECT b.booking_id, c.name AS car_name, b.pick_up_date, b.return_date, b.total_cost, b.status, b.payment_status, u.email, u.gender 
+            $stmt = $pdo->prepare("SELECT b.booking_id, c.name AS car_name, b.pick_up_date, b.return_date, b.total_days, b.total_cost, b.status, b.payment_status, u.email, u.gender 
                                    FROM bookings b 
                                    JOIN users u ON b.user_id = u.id 
                                    JOIN cars c ON b.car_id = c.id 
@@ -322,12 +394,46 @@ if ($report_type) {
             $report_data = $stmt->fetchAll();
             break;
         case 'cars':
-            $stmt = $pdo->prepare("SELECT name, model, license_plate, capacity, fuel_type, price_per_day, status 
+            $stmt = $pdo->prepare("SELECT name, model, license_plate, capacity, fuel_type, price_per_day, status, featured 
                                    FROM cars 
                                    WHERE name LIKE ? OR model LIKE ? OR license_plate LIKE ?");
             $stmt->execute(["%$search%", "%$search%", "%$search%"]);
             $report_data = $stmt->fetchAll();
             break;
+        case 'extra_charges':
+            $stmt = $pdo->prepare("SELECT e.id, b.booking_id, e.days_late, e.extra_cost, e.created_at 
+                                   FROM extra_charges e 
+                                   JOIN bookings b ON e.booking_id = b.id 
+                                   WHERE b.booking_id LIKE ?");
+            $stmt->execute(["%$search%"]);
+            $report_data = $stmt->fetchAll();
+            break;
+        case 'payments':
+            $stmt = $pdo->prepare("SELECT p.id, u.email AS user_email, b.booking_id, p.tx_ref, p.amount, p.status, p.type, p.created_at, p.charge_id 
+                                   FROM payments p 
+                                   LEFT JOIN users u ON p.user_id = u.id 
+                                   LEFT JOIN bookings b ON p.booking_id = b.id 
+                                   WHERE p.tx_ref LIKE ? OR p.charge_id LIKE ?");
+            $stmt->execute(["%$search%", "%$search%"]);
+            $report_data = $stmt->fetchAll();
+            break;
+    }
+
+    // Export to CSV
+    if (isset($_GET['export']) && $_GET['export'] == 'csv') {
+        header('Content-Type: text/csv');
+        header('Content-Disposition: attachment; filename="' . $report_type . '_report_' . date('Ymd') . '.csv"');
+        $output = fopen('php://output', 'w');
+        
+        // Write headers
+        if ($report_data) {
+            fputcsv($output, array_keys($report_data[0]));
+            foreach ($report_data as $row) {
+                fputcsv($output, $row);
+            }
+        }
+        fclose($output);
+        exit;
     }
 }
 ?>
@@ -337,7 +443,7 @@ if ($report_type) {
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Admin Dashboard - CarRental</title>
+    <title>Admin Dashboard - Mibesa CarRental</title>
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0-beta3/css/all.min.css">
     <style>
         * { margin: 0; padding: 0; box-sizing: border-box; font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; }
@@ -352,39 +458,18 @@ if ($report_type) {
         .sidebar ul li i { width: 24px; font-size: 1.2rem; }
         .content { margin-left: 250px; padding: 80px 20px 20px; width: calc(100% - 250px); transition: margin-left 0.3s ease, width 0.3s ease; }
         .content.collapsed { margin-left: 0; width: 100%; }
-        .topbar { display: flex; justify-content: space-between; align-items: center; padding: 0 20px; background-color: #ffffff; box-shadow: 0 2px 10px rgba(0, 0, 0, 0.1); height: 60px; position: fixed; top: 0; right: 0; left: 250px; z-index: 99; transition: left: 0.3s ease; }
+        .topbar { display: flex; justify-content: space-between; align-items: center; padding: 0 20px; background-color: #ffffff; box-shadow: 0 2px 10px rgba(0, 0, 0, 0.1); height: 60px; position: fixed; top: 0; right: 0; left: 250px; z-index: 99; transition: left 0.3s ease; }
         .topbar.collapsed { left: 0; }
         .hamburger { font-size: 1.5rem; cursor: pointer; color: #333; }
         .user-actions { display: flex; align-items: center; gap: 20px; }
-        .notification-bell { position: relative; cursor: pointer; font-size: 1.2rem; }
-        .notification-bell .badge { position: absolute; top: -5px; right: -5px; background-color: #e74c3c; color: white; border-radius: 50%; width: 15px; height: 15px; font-size: 10px; display: flex; justify-content: center; align-items: center; }
         .user-profile-small { display: flex; align-items: center; gap: 10px; cursor: pointer; font-size: 0.9rem; font-weight: 500; }
         .user-profile-small img { width: 35px; height: 35px; border-radius: 50%; object-fit: cover; }
-        .slider-container { position: relative; width: 100%; height: 300px; overflow: hidden; border-radius: 8px; margin-bottom: 20px; box-shadow: 0 4px 8px rgba(0, 0, 0, 0.1); }
-        .slider { display: flex; width: 300%; height: 100%; transition: transform 0.5s ease-in-out; }
-        .slide { width: 100%; height: 100%; position: relative; display: none; }
-        .slide.active { display: block; }
-        .slide img { width: 100%; height: 100%; object-fit: cover; }
-        .slide-text { position: absolute; bottom: 20px; left: 20px; background: rgba(0, 0, 0, 0.7); color: #ffffff; padding: 10px 20px; border-radius: 6px; font-size: 1.2rem; font-weight: 500; text-shadow: 0 1px 2px rgba(0, 0, 0, 0.5); }
-        .user-profile { display: flex; align-items: flex-start; gap: 20px; background-color: #ffffff; padding: 20px; border-radius: 8px; box-shadow: 0 4px 8px rgba(0, 0, 0, 0.1); margin-bottom: 20px; }
-        .profile-image-container { text-align: center; }
-        .profile-image { width: 150px; height: 150px; border-radius: 50%; object-fit: cover; margin-bottom: 15px; box-shadow: 0 4px 8px rgba(0, 0, 0, 0.1); }
-        .upload-btn { background: #0b0c10; color: #66fcf1; padding: 8px 12px; border: none; border-radius: 4px; cursor: pointer; font-size: 0.9rem; transition: opacity 0.3s ease; }
-        .upload-btn:hover { opacity: 0.9; }
-        .user-profile .details { flex: 1; }
-        .user-profile .details h3 { font-size: 1.5rem; color: #2c3e50; margin-bottom: 15px; font-weight: 600; }
-        .profile-info { display: flex; flex-direction: column; gap: 15px; }
-        .profile-info label { font-weight: 500; color: #34495e; font-size: 0.95rem; }
-        .profile-info input { padding: 10px; border-radius: 6px; border: 1px solid #ddd; background-color: #f5f5f5; width: 100%; font-size: 1rem; font-weight: 400; }
-        .profile-info input:disabled { background-color: #e9ecef; cursor: not-allowed; }
-        .profile-info button { background: #0b0c10; color: #66fcf1; padding: 10px 20px; border: none; border-radius: 6px; cursor: pointer; font-size: 1rem; margin-top: 10px; align-self: flex-start; transition: opacity 0.3s ease; }
-        .profile-info button:hover { opacity: 0.9; }
-        .user-activity { background-color: #ffffff; padding: 20px; border-radius: 8px; box-shadow: 0 4px 8px rgba(0, 0, 0, 0.1); margin-bottom: 60px; }
-        .user-activity h2 { font-size: 1.5rem; color: #2c3e50; margin-bottom: 15px; border-bottom: 1px solid #eee; padding-bottom: 10px; font-weight: 600; }
-        .user-activity ul { list-style: none; }
-        .user-activity ul li { font-size: 1rem; color: #7f8c8d; margin-bottom: 10px; padding: 10px; border-radius: 4px; background-color: #f8f9fa; border-left: 3px solid #45a29e; font-weight: 400; }
         .dashboard-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px; }
         .dashboard-header h1 { font-size: 2rem; color: #2c3e50; font-weight: 600; }
+        .stats-container { display: flex; gap: 20px; margin-bottom: 20px; }
+        .stat-card { background-color: #ffffff; padding: 20px; border-radius: 8px; box-shadow: 0 4px 8px rgba(0, 0, 0, 0.1); flex: 1; text-align: center; }
+        .stat-card h3 { font-size: 1.2rem; color: #2c3e50; margin-bottom: 10px; }
+        .stat-card p { font-size: 1.8rem; color: #45a29e; font-weight: 600; }
         .controls { display: flex; gap: 10px; margin-bottom: 20px; }
         .controls input[type="text"], .controls select { padding: 10px; border-radius: 6px; border: 1px solid #ddd; flex-grow: 1; max-width: 400px; font-size: 1rem; font-weight: 400; }
         .controls button, .action-btn { padding: 10px 15px; border: none; border-radius: 6px; cursor: pointer; background-color: #0b0c10; color: #66fcf1; font-weight: 500; font-size: 0.9rem; transition: opacity 0.3s ease; }
@@ -397,15 +482,14 @@ if ($report_type) {
         .data-table td { color: #34495e; font-weight: 400; }
         .data-table tbody tr:hover { background-color: #f8f9fa; }
         .status { padding: 4px 8px; border-radius: 20px; font-size: 0.85rem; font-weight: 500; display: inline-block; text-align: center; }
-        .status-booked, .status-approved { background-color: #e3fcef; color: #00875a; }
+        .status-booked, .status-approved, .status-paid { background-color: #e3fcef; color: #00875a; }
         .status-available, .status-pending { background-color: #fff8e6; color: #b25000; }
-        .status-cancelled, .status-declined { background-color: #fee4e2; color: #d92d20; }
+        .status-cancelled, .status-declined, .status-unpaid { background-color: #fee4e2; color: #d92d20; }
         .action-btn-container { display: flex; gap: 5px; justify-content: flex-start; }
         .action-btn { padding: 6px 12px; font-size: 0.85rem; }
-        .action-btn.approve, .verify-btn { background-color: #0b0c10; color: #66fcf1; }
+        .action-btn.approve, .action-btn.verify { background-color: #0b0c10; color: #66fcf1; }
         .action-btn.decline, .action-btn.delete { background-color: #fee4e2; color: #d92d20; }
         .action-btn.edit { background-color: #0b0c10; color: #66fcf1; }
-        .verify-btn:hover { background-color: #66fcf1; color: #0b0c10; }
         .modal { display: none; position: fixed; top: 0; left: 0; width: 100%; height: 100%; background-color: rgba(0, 0, 0, 0.5); z-index: 1000; justify-content: center; align-items: center; }
         .modal-content { background-color: #ffffff; border-radius: 8px; padding: 20px; width: 500px; max-width: 90%; }
         .modal-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px; }
@@ -417,12 +501,14 @@ if ($report_type) {
         .car-thumbnail { width: 60px; height: 60px; object-fit: cover; border-radius: 6px; }
         .alert { background: #ffdddd; border-left: 6px solid #f44336; padding: 10px; margin-bottom: 15px; }
         .success { background: #ddffdd; border-left: 6px solid #4caf50; padding: 10px; margin-bottom: 15px; }
+        .inline-error { color: #d92d20; font-size: 0.85rem; margin-top: 5px; display: none; }
         .table-container { overflow-x: auto; }
         .footer { text-align: center; padding: 15px; background-color: #0b0c10; color: #ecf0f1; position: fixed; width: 100%; bottom: 0; left: 0; z-index: 98; font-size: 0.9rem; font-weight: 400; }
         .section { display: none; }
         .section.active { display: block; }
         .national-id-links a { color: #45a29e; text-decoration: none; margin-right: 10px; }
         .national-id-links a:hover { color: #66fcf1; }
+        .export-btn { background-color: #45a29e; color: #fff; }
         @media (max-width: 768px) {
             .sidebar { width: 200px; }
             .sidebar.collapsed { width: 0; }
@@ -432,10 +518,10 @@ if ($report_type) {
             .topbar.collapsed { left: 0; }
             .sidebar h2, .welcome-text { font-size: 0.8rem; }
             .sidebar ul li { padding: 10px; font-size: 0.9rem; }
-            .slider-container { height: 200px; }
-            .slide-text { font-size: 1rem; padding: 8px 15px; }
+            .stats-container { flex-direction: column; }
             .data-table th, .data-table td { padding: 8px; font-size: 0.85rem; }
             .action-btn { padding: 6px 10px; font-size: 0.8rem; }
+            .modal-content { width: 90%; }
         }
     </style>
 </head>
@@ -444,26 +530,22 @@ if ($report_type) {
         <h2>MIBESA</h2>
         <div class="welcome-text">Welcome, Admin!</div>
         <ul>
-            <li onclick="showSection('dashboard')"><i class="fas fa-home"></i> Dashboard</li>
-            <li onclick="showSection('manage-cars')"><i class="fas fa-car"></i> Manage Cars</li>
-            <li onclick="showSection('manage-users')"><i class="fas fa-users"></i> Manage Users</li>
-            <li onclick="showSection('manage-bookings')"><i class="fas fa-calendar-check"></i> Manage Bookings</li>
-            <li onclick="showSection('reports')"><i class="fas fa-chart-line"></i> Reports</li>
-            <li onclick="showSection('profile')"><i class="fas fa-user"></i> Profile</li>
-            <li onclick="logout()"><i class="fas fa-sign-out-alt"></i> Logout</li>
+            <li onclick="showSection('dashboard')" aria-label="Dashboard"><i class="fas fa-home"></i> Dashboard</li>
+            <li onclick="showSection('manage-cars')" aria-label="Manage Cars"><i class="fas fa-car"></i> Manage Cars</li>
+            <li onclick="showSection('manage-users')" aria-label="Manage Users"><i class="fas fa-users"></i> Manage Users</li>
+            <li onclick="showSection('manage-bookings')" aria-label="Manage Bookings"><i class="fas fa-calendar-check"></i> Manage Bookings</li>
+            <li onclick="showSection('reports')" aria-label="Reports"><i class="fas fa-chart-line"></i> Reports</li>
+            <li onclick="showSection('profile')" aria-label="Profile"><i class="fas fa-user"></i> Profile</li>
+            <li onclick="logout()" aria-label="Logout"><i class="fas fa-sign-out-alt"></i> Logout</li>
         </ul>
     </div>
 
     <div class="topbar" id="topbar">
-        <div class="hamburger" onclick="toggleSidebar()">
+        <div class="hamburger" onclick="toggleSidebar()" aria-label="Toggle Sidebar">
             <i class="fas fa-bars"></i>
         </div>
         <div class="user-actions">
-            <div class="notification-bell">
-                <i class="fas fa-bell"></i>
-                <span class="badge"><?php echo count($users); ?></span>
-            </div>
-            <div class="user-profile-small" onclick="showSection('profile')">
+            <div class="user-profile-small" onclick="showSection('profile')" aria-label="Admin Profile">
                 <img src="https://via.placeholder.com/80" alt="Admin Profile">
                 <span>Admin</span>
             </div>
@@ -479,39 +561,59 @@ if ($report_type) {
         <?php endif; ?>
 
         <!-- Dashboard Section -->
-        <div class="section <?php echo (!isset($_GET['section']) || $_GET['section'] == 'dashboard') ? 'active' : ''; ?>" id="dashboard">
+        <section class="section <?php echo (!isset($_GET['section']) || $_GET['section'] == 'dashboard') ? 'active' : ''; ?>" id="dashboard">
             <div class="dashboard-header">
                 <h1>Manager Dashboard</h1>
             </div>
-            <div class="slider-container">
-                <div class="slider" id="dashboardSlider">
-                    <div class="slide active">
-                        <img src="https://via.placeholder.com/1200x300?text=Car+1" alt="Car 1">
-                        <div class="slide-text">Manage Your Fleet Efficiently</div>
-                    </div>
-                    <div class="slide">
-                        <img src="https://via.placeholder.com/1200x300?text=Car+2" alt="Car 2">
-                        <div class="slide-text">Streamline Booking Approvals</div>
-                    </div>
-                    <div class="slide">
-                        <img src="https://via.placeholder.com/1200x300?text=Car+3" alt="Car 3">
-                        <div class="slide-text">Monitor User Activity</div>
-                    </div>
+            <div class="stats-container">
+                <div class="stat-card">
+                    <h3>Customers</h3>
+                    <p><?php echo $customer_count; ?></p>
+                </div>
+                <div class="stat-card">
+                    <h3>Cars</h3>
+                    <p><?php echo $car_count; ?></p>
+                </div>
+                <div class="stat-card">
+                    <h3>Bookings</h3>
+                    <p><?php echo $booking_count; ?></p>
                 </div>
             </div>
             <div class="content-card">
-                <h2>Recent Activity</h2>
-                <ul>
-                    <li>Approved new car booking request for Toyota Corolla.</li>
-                    <li>Updated user profile for Mary Smith.</li>
-                    <li>Added new car to the fleet: Nissan X-Trail.</li>
-                    <li>Reviewed booking history for Paul Johnson.</li>
-                </ul>
+                <h2>Recent Bookings</h2>
+                <div class="table-container">
+                    <table class="data-table">
+                        <thead>
+                            <tr>
+                                <th>Booking ID</th>
+                                <th>Customer</th>
+                                <th>Car</th>
+                                <th>Pick-up Date</th>
+                                <th>Return Date</th>
+                                <th>Total Cost</th>
+                                <th>Status</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            <?php foreach ($recent_bookings as $booking): ?>
+                                <tr>
+                                    <td><?php echo htmlspecialchars($booking['booking_id']); ?></td>
+                                    <td><?php echo htmlspecialchars($booking['customer']); ?></td>
+                                    <td><?php echo htmlspecialchars($booking['car_name']); ?></td>
+                                    <td><?php echo htmlspecialchars($booking['pick_up_date']); ?></td>
+                                    <td><?php echo htmlspecialchars($booking['return_date']); ?></td>
+                                    <td><?php echo htmlspecialchars($booking['total_cost']); ?> MWK</td>
+                                    <td><span class="status status-<?php echo strtolower($booking['status']); ?>"><?php echo htmlspecialchars($booking['status']); ?></span></td>
+                                </tr>
+                            <?php endforeach; ?>
+                        </tbody>
+                    </table>
+                </div>
             </div>
-        </div>
+        </section>
 
         <!-- Manage Cars Section -->
-        <div class="section <?php echo (isset($_GET['section']) && $_GET['section'] == 'manage-cars') ? 'active' : ''; ?>" id="manage-cars">
+        <section class="section <?php echo (isset($_GET['section']) && $_GET['section'] == 'manage-cars') ? 'active' : ''; ?>" id="manage-cars">
             <div class="dashboard-header">
                 <h1>Manage Cars</h1>
             </div>
@@ -522,12 +624,12 @@ if ($report_type) {
                     <option value="available" <?php echo $filter == 'available' ? 'selected' : ''; ?>>Available</option>
                     <option value="booked" <?php echo $filter == 'booked' ? 'selected' : ''; ?>>Booked</option>
                 </select>
-                <button onclick="applyCarSearchFilter()"><i class="fas fa-search"></i> Search</button>
+                <button onclick="applyCarSearchFilter()" aria-label="Search Cars"><i class="fas fa-search"></i> Search</button>
             </div>
             <div class="content-card">
                 <h2>
                     Car Inventory
-                    <button class="action-btn" onclick="openModal('carModal')">
+                    <button class="action-btn" onclick="openModal('carModal')" aria-label="Add New Car">
                         <i class="fas fa-plus"></i> Add New Car
                     </button>
                 </h2>
@@ -563,15 +665,16 @@ if ($report_type) {
                                     <td><?php echo htmlspecialchars($car['license_plate']); ?></td>
                                     <td><?php echo htmlspecialchars($car['capacity']); ?></td>
                                     <td><?php echo htmlspecialchars($car['fuel_type']); ?></td>
-                                    <td><?php echo htmlspecialchars($car['price_per_day'] ?? '50'); ?> MWK</td>
+                                    <td><?php echo htmlspecialchars($car['price_per_day']); ?> MWK</td>
                                     <td><?php echo $car['featured'] ? 'Yes' : 'No'; ?></td>
                                     <td><span class="status status-<?php echo strtolower($car['status']); ?>"><?php echo htmlspecialchars($car['status']); ?></span></td>
                                     <td>
                                         <div class="action-btn-container">
-                                            <button class="action-btn edit" onclick='openEditCarModal(<?php echo json_encode($car); ?>)'>Edit</button>
-                                            <form method="POST" style="display:inline;">
+                                            <button class="action-btn edit" onclick='openEditCarModal(<?php echo json_encode($car); ?>)' aria-label="Edit Car">Edit</button>
+                                            <form method="POST" style="display:inline;" onsubmit="return confirm('Are you sure you want to delete this car?')">
+                                                <input type="hidden" name="csrf_token" value="<?php echo generate_csrf_token(); ?>">
                                                 <input type="hidden" name="car_id" value="<?php echo $car['id']; ?>">
-                                                <button type="submit" name="delete_car" class="action-btn delete" onclick="return confirm('Are you sure you want to delete this car?')">Delete</button>
+                                                <button type="submit" name="delete_car" class="action-btn delete" aria-label="Delete Car">Delete</button>
                                             </form>
                                         </div>
                                     </td>
@@ -581,10 +684,10 @@ if ($report_type) {
                     </table>
                 </div>
             </div>
-        </div>
+        </section>
 
         <!-- Manage Users Section -->
-        <div class="section <?php echo (isset($_GET['section']) && $_GET['section'] == 'manage-users') ? 'active' : ''; ?>" id="manage-users">
+        <section class="section <?php echo (isset($_GET['section']) && $_GET['section'] == 'manage-users') ? 'active' : ''; ?>" id="manage-users">
             <div class="dashboard-header">
                 <h1>Manage Users</h1>
             </div>
@@ -596,7 +699,7 @@ if ($report_type) {
                     <option value="approved" <?php echo $filter == 'approved' ? 'selected' : ''; ?>>Approved</option>
                     <option value="declined" <?php echo $filter == 'declined' ? 'selected' : ''; ?>>Declined</option>
                 </select>
-                <button onclick="applyUserSearchFilter()"><i class="fas fa-search"></i> Search</button>
+                <button onclick="applyUserSearchFilter()" aria-label="Search Users"><i class="fas fa-search"></i> Search</button>
             </div>
             <div class="content-card">
                 <h2>User Accounts</h2>
@@ -604,18 +707,16 @@ if ($report_type) {
                     <table class="data-table">
                         <thead>
                             <tr>
+                                <th>Username</th>
                                 <th>Email</th>
                                 <th>Phone</th>
                                 <th>Gender</th>
+                                <th>Age</th>
                                 <th>Address</th>
                                 <th>Location</th>
                                 <th>Kin Name</th>
                                 <th>Kin Relationship</th>
                                 <th>Kin Phone</th>
-                                <th>Has Paid</th>
-                                <th>Payment Status</th>
-                                <th>Payment Amount</th>
-                                <th>Tx Ref</th>
                                 <th>National ID</th>
                                 <th>Status</th>
                                 <th>Actions</th>
@@ -624,23 +725,21 @@ if ($report_type) {
                         <tbody>
                             <?php foreach ($users as $user): ?>
                                 <tr>
+                                    <td><?php echo htmlspecialchars($user['username']); ?></td>
                                     <td><?php echo htmlspecialchars($user['email']); ?></td>
                                     <td><?php echo htmlspecialchars($user['phone']); ?></td>
                                     <td><?php echo htmlspecialchars($user['gender']); ?></td>
+                                    <td><?php echo htmlspecialchars($user['age']); ?></td>
                                     <td><?php echo htmlspecialchars($user['address']); ?></td>
                                     <td><?php echo htmlspecialchars($user['location']); ?></td>
                                     <td><?php echo htmlspecialchars($user['kin_name'] ?? 'N/A'); ?></td>
                                     <td><?php echo htmlspecialchars($user['kin_relationship'] ?? 'N/A'); ?></td>
                                     <td><?php echo htmlspecialchars($user['kin_phone'] ?? 'N/A'); ?></td>
-                                    <td><?php echo $user['has_paid'] ? 'Yes' : 'No'; ?></td>
-                                    <td><?php echo htmlspecialchars($user['payment_status'] ?? 'N/A'); ?></td>
-                                    <td><?php echo htmlspecialchars($user['payment_amount'] ?? 'N/A'); ?> MWK</td>
-                                    <td><?php echo htmlspecialchars($user['tx_ref'] ?? 'N/A'); ?></td>
                                     <td>
-                                        <?php if ($user['national_id']): ?>
+                                        <?php if ($user['national_id'] && strpos($user['national_id'], 'data:application/pdf;base64,') === 0): ?>
                                             <div class="national-id-links">
-                                                <a href="data:application/pdf;base64,<?php echo htmlspecialchars($user['national_id']); ?>" target="_blank">View</a>
-                                                <a href="#" onclick="downloadNationalId('<?php echo htmlspecialchars($user['national_id']); ?>', '<?php echo htmlspecialchars($user['id'] . '_' . str_replace('@', '_', $user['email'])); ?>')">Download</a>
+                                                <a href="<?php echo htmlspecialchars($user['national_id']); ?>" target="_blank" aria-label="View National ID">View</a>
+                                                <a href="javascript:void(0)" onclick="downloadNationalId('<?php echo htmlspecialchars($user['national_id']); ?>', '<?php echo htmlspecialchars($user['id'] . '_' . str_replace('@', '_', $user['email'])); ?>')" aria-label="Download National ID">Download</a>
                                             </div>
                                         <?php else: ?>
                                             N/A
@@ -648,19 +747,16 @@ if ($report_type) {
                                     </td>
                                     <td><span class="status status-<?php echo strtolower($user['status']); ?>"><?php echo htmlspecialchars($user['status']); ?></span></td>
                                     <td>
-                                        <form method="POST" style="display:inline;">
+                                        <form method="POST" style="display:inline;" id="userActionForm_<?php echo $user['id']; ?>">
+                                            <input type="hidden" name="csrf_token" value="<?php echo generate_csrf_token(); ?>">
                                             <input type="hidden" name="user_id" value="<?php echo $user['id']; ?>">
                                             <div class="action-btn-container">
-                                                <button type="button" class="action-btn edit" onclick='openEditUserModal(<?php echo json_encode($user); ?>)'>Edit</button>
-                                                <?php if ($user['status'] == 'pending' && $user['payment_status'] == 'paid'): ?>
-                                                    <button type="submit" name="user_action" value="approved" class="action-btn approve">Approve</button>
-                                                    <button type="submit" name="user_action" value="declined" class="action-btn decline">Decline</button>
+                                                <button type="button" class="action-btn edit" onclick='openEditUserModal(<?php echo json_encode($user); ?>)' aria-label="Edit User">Edit</button>
+                                                <?php if ($user['status'] == 'pending'): ?>
+                                                    <button type="submit" name="user_action" value="approved" class="action-btn approve" onclick="return confirm('Are you sure you want to approve this user?')" aria-label="Approve User">Approve</button>
+                                                    <button type="button" class="action-btn decline" onclick="openRejectionModal('<?php echo $user['id']; ?>')" aria-label="Decline User">Decline</button>
                                                 <?php endif; ?>
-                                                <button type="submit" name="delete_user" class="action-btn delete" onclick="return confirm('Are you sure you want to delete this user?')">Delete</button>
-                                                <?php if ($user['payment_status'] == 'pending' && $user['tx_ref']): ?>
-                                                    <input type="hidden" name="type" value="signup">
-                                                    <button type="submit" name="verify_payment" class="action-btn verify-btn">Verify Payment</button>
-                                                <?php endif; ?>
+                                                <button type="submit" name="delete_user" class="action-btn delete" onclick="return confirm('Are you sure you want to delete this user?')" aria-label="Delete User">Delete</button>
                                             </div>
                                         </form>
                                     </td>
@@ -670,10 +766,10 @@ if ($report_type) {
                     </table>
                 </div>
             </div>
-        </div>
+        </section>
 
         <!-- Manage Bookings Section -->
-        <div class="section <?php echo (isset($_GET['section']) && $_GET['section'] == 'manage-bookings') ? 'active' : ''; ?>" id="manage-bookings">
+        <section class="section <?php echo (isset($_GET['section']) && $_GET['section'] == 'manage-bookings') ? 'active' : ''; ?>" id="manage-bookings">
             <div class="dashboard-header">
                 <h1>Manage Bookings</h1>
             </div>
@@ -685,7 +781,7 @@ if ($report_type) {
                     <option value="booked" <?php echo $filter == 'booked' ? 'selected' : ''; ?>>Booked</option>
                     <option value="cancelled" <?php echo $filter == 'cancelled' ? 'selected' : ''; ?>>Cancelled</option>
                 </select>
-                <button onclick="applyBookingSearchFilter()"><i class="fas fa-search"></i> Search</button>
+                <button onclick="applyBookingSearchFilter()" aria-label="Search Bookings"><i class="fas fa-search"></i> Search</button>
             </div>
             <div class="content-card">
                 <h2>All Bookings</h2>
@@ -699,10 +795,8 @@ if ($report_type) {
                                 <th>Pick-up Date</th>
                                 <th>Return Date</th>
                                 <th>Total Cost</th>
-                                <th>Status</th>
                                 <th>Payment Status</th>
-                                <th>Payment Amount</th>
-                                <th>Tx Ref</th>
+                                <th>Status</th>
                                 <th>Actions</th>
                             </tr>
                         </thead>
@@ -715,21 +809,16 @@ if ($report_type) {
                                     <td><?php echo htmlspecialchars($booking['pick_up_date']); ?></td>
                                     <td><?php echo htmlspecialchars($booking['return_date']); ?></td>
                                     <td><?php echo htmlspecialchars($booking['total_cost']); ?> MWK</td>
+                                    <td><span class="status status-<?php echo strtolower($booking['payment_status']); ?>"><?php echo htmlspecialchars($booking['payment_status']); ?></span></td>
                                     <td><span class="status status-<?php echo strtolower($booking['status']); ?>"><?php echo htmlspecialchars($booking['status']); ?></span></td>
-                                    <td><?php echo htmlspecialchars($booking['payment_status'] ?? 'N/A'); ?></td>
-                                    <td><?php echo htmlspecialchars($booking['payment_amount'] ?? 'N/A'); ?> MWK</td>
-                                    <td><?php echo htmlspecialchars($booking['tx_ref'] ?? 'N/A'); ?></td>
                                     <td>
                                         <form method="POST" style="display:inline;">
+                                            <input type="hidden" name="csrf_token" value="<?php echo generate_csrf_token(); ?>">
                                             <input type="hidden" name="booking_id" value="<?php echo $booking['id']; ?>">
                                             <div class="action-btn-container">
-                                                <?php if ($booking['status'] == 'pending' && $booking['payment_status'] == 'paid'): ?>
-                                                    <button type="submit" name="booking_action" value="booked" class="action-btn approve">Approve</button>
-                                                    <button type="submit" name="booking_action" value="cancelled" class="action-btn decline">Cancel</button>
-                                                <?php endif; ?>
-                                                <?php if ($booking['payment_status'] == 'pending' && $booking['tx_ref']): ?>
-                                                    <input type="hidden" name="type" value="booking">
-                                                    <button type="submit" name="verify_payment" class="action-btn verify-btn">Verify Payment</button>
+                                                <?php if ($booking['status'] == 'pending'): ?>
+                                                    <button type="submit" name="action" value="booked" class="action-btn approve" onclick="return confirm('Are you sure you want to approve this booking?')" aria-label="Approve Booking">Approve</button>
+                                                    <button type="submit" name="action" value="cancelled" class="action-btn decline" onclick="return confirm('Are you sure you want to cancel this booking?')" aria-label="Cancel Booking">Cancel</button>
                                                 <?php endif; ?>
                                             </div>
                                         </form>
@@ -740,25 +829,29 @@ if ($report_type) {
                     </table>
                 </div>
             </div>
-        </div>
+        </section>
 
         <!-- Reports Section -->
-        <div class="section <?php echo (isset($_GET['section']) && $_GET['section'] == 'reports') ? 'active' : ''; ?>" id="reports">
+        <section class="section <?php echo (isset($_GET['section']) && $_GET['section'] == 'reports') ? 'active' : ''; ?>" id="reports">
             <div class="dashboard-header">
                 <h1>Generate Reports</h1>
             </div>
             <div class="controls">
                 <form id="reportForm" method="GET" action="admin_dashboard.php">
                     <input type="hidden" name="section" value="reports">
-                    <select name="report_type" id="reportType" required>
+                    <select name="report_type" id="reportType" required aria-label="Report Type">
                         <option value="" <?php echo $report_type == '' ? 'selected' : ''; ?>>Select Report Type</option>
                         <option value="users" <?php echo $report_type == 'users' ? 'selected' : ''; ?>>Users</option>
-                        <option value="payments" <?php echo $report_type == 'payments' ? 'selected' : ''; ?>>Payments</option>
                         <option value="bookings" <?php echo $report_type == 'bookings' ? 'selected' : ''; ?>>Bookings</option>
                         <option value="cars" <?php echo $report_type == 'cars' ? 'selected' : ''; ?>>Cars</option>
+                        <option value="extra_charges" <?php echo $report_type == 'extra_charges' ? 'selected' : ''; ?>>Extra Charges</option>
+                        <option value="payments" <?php echo $report_type == 'payments' ? 'selected' : ''; ?>>Payments</option>
                     </select>
-                    <input type="text" name="search" placeholder="Search report data..." value="<?php echo htmlspecialchars($search); ?>">
-                    <button type="submit"><i class="fas fa-chart-line"></i> Generate Report</button>
+                    <input type="text" name="search" id="reportSearch" placeholder="Search report data..." value="<?php echo htmlspecialchars($search); ?>">
+                    <button type="submit" aria-label="Generate Report"><i class="fas fa-chart-line"></i> Generate Report</button>
+                    <?php if ($report_type): ?>
+                        <a href="admin_dashboard.php?section=reports&report_type=<?php echo $report_type; ?>&search=<?php echo urlencode($search); ?>&export=csv" class="action-btn export-btn">Export to CSV</a>
+                    <?php endif; ?>
                 </form>
             </div>
             <div class="content-card">
@@ -772,33 +865,28 @@ if ($report_type) {
                                 <thead>
                                     <tr>
                                         <?php if ($report_type == 'users'): ?>
+                                            <th>Username</th>
                                             <th>Email</th>
                                             <th>Phone</th>
                                             <th>Gender</th>
+                                            <th>Age</th>
                                             <th>Address</th>
                                             <th>Location</th>
                                             <th>Kin Name</th>
                                             <th>Kin Relationship</th>
                                             <th>Kin Phone</th>
                                             <th>Status</th>
-                                            <th>Payment Status</th>
-                                        <?php elseif ($report_type == 'payments'): ?>
-                                            <th>User Email</th>
-                                            <th>User Gender</th>
-                                            <th>Tx Ref</th>
-                                            <th>Amount</th>
-                                            <th>Status</th>
-                                            <th>Type</th>
                                         <?php elseif ($report_type == 'bookings'): ?>
-                                            <th>User Email</th>
-                                            <th>User Gender</th>
                                             <th>Booking ID</th>
                                             <th>Car Name</th>
                                             <th>Pick-up Date</th>
                                             <th>Return Date</th>
+                                            <th>Total Days</th>
                                             <th>Total Cost</th>
                                             <th>Status</th>
                                             <th>Payment Status</th>
+                                            <th>User Email</th>
+                                            <th>User Gender</th>
                                         <?php elseif ($report_type == 'cars'): ?>
                                             <th>Name</th>
                                             <th>Model</th>
@@ -807,6 +895,23 @@ if ($report_type) {
                                             <th>Fuel Type</th>
                                             <th>Price/Day</th>
                                             <th>Status</th>
+                                            <th>Featured</th>
+                                        <?php elseif ($report_type == 'extra_charges'): ?>
+                                            <th>ID</th>
+                                            <th>Booking ID</th>
+                                            <th>Days Late</th>
+                                            <th>Extra Cost</th>
+                                            <th>Created At</th>
+                                        <?php elseif ($report_type == 'payments'): ?>
+                                            <th>ID</th>
+                                            <th>User Email</th>
+                                            <th>Booking ID</th>
+                                            <th>Transaction Ref</th>
+                                            <th>Amount</th>
+                                            <th>Status</th>
+                                            <th>Type</th>
+                                            <th>Created At</th>
+                                            <th>Charge ID</th>
                                         <?php endif; ?>
                                     </tr>
                                 </thead>
@@ -814,33 +919,28 @@ if ($report_type) {
                                     <?php foreach ($report_data as $row): ?>
                                         <tr>
                                             <?php if ($report_type == 'users'): ?>
+                                                <td><?php echo htmlspecialchars($row['username']); ?></td>
                                                 <td><?php echo htmlspecialchars($row['email']); ?></td>
                                                 <td><?php echo htmlspecialchars($row['phone']); ?></td>
                                                 <td><?php echo htmlspecialchars($row['gender']); ?></td>
+                                                <td><?php echo htmlspecialchars($row['age']); ?></td>
                                                 <td><?php echo htmlspecialchars($row['address']); ?></td>
                                                 <td><?php echo htmlspecialchars($row['location']); ?></td>
                                                 <td><?php echo htmlspecialchars($row['kin_name'] ?? 'N/A'); ?></td>
                                                 <td><?php echo htmlspecialchars($row['kin_relationship'] ?? 'N/A'); ?></td>
                                                 <td><?php echo htmlspecialchars($row['kin_phone'] ?? 'N/A'); ?></td>
                                                 <td><span class="status status-<?php echo strtolower($row['status']); ?>"><?php echo htmlspecialchars($row['status']); ?></span></td>
-                                                <td><?php echo htmlspecialchars($row['payment_status']); ?></td>
-                                            <?php elseif ($report_type == 'payments'): ?>
-                                                <td><?php echo htmlspecialchars($row['email'] ?? 'N/A'); ?></td>
-                                                <td><?php echo htmlspecialchars($row['gender'] ?? 'N/A'); ?></td>
-                                                <td><?php echo htmlspecialchars($row['tx_ref']); ?></td>
-                                                <td><?php echo htmlspecialchars($row['amount']); ?> MWK</td>
-                                                <td><?php echo htmlspecialchars($row['status']); ?></td>
-                                                <td><?php echo htmlspecialchars($row['type']); ?></td>
                                             <?php elseif ($report_type == 'bookings'): ?>
-                                                <td><?php echo htmlspecialchars($row['email']); ?></td>
-                                                <td><?php echo htmlspecialchars($row['gender']); ?></td>
                                                 <td><?php echo htmlspecialchars($row['booking_id']); ?></td>
                                                 <td><?php echo htmlspecialchars($row['car_name']); ?></td>
                                                 <td><?php echo htmlspecialchars($row['pick_up_date']); ?></td>
                                                 <td><?php echo htmlspecialchars($row['return_date']); ?></td>
+                                                <td><?php echo htmlspecialchars($row['total_days']); ?></td>
                                                 <td><?php echo htmlspecialchars($row['total_cost']); ?> MWK</td>
                                                 <td><span class="status status-<?php echo strtolower($row['status']); ?>"><?php echo htmlspecialchars($row['status']); ?></span></td>
-                                                <td><?php echo htmlspecialchars($row['payment_status']); ?></td>
+                                                <td><span class="status status-<?php echo strtolower($row['payment_status']); ?>"><?php echo htmlspecialchars($row['payment_status']); ?></span></td>
+                                                <td><?php echo htmlspecialchars($row['email']); ?></td>
+                                                <td><?php echo htmlspecialchars($row['gender']); ?></td>
                                             <?php elseif ($report_type == 'cars'): ?>
                                                 <td><?php echo htmlspecialchars($row['name']); ?></td>
                                                 <td><?php echo htmlspecialchars($row['model']); ?></td>
@@ -849,6 +949,23 @@ if ($report_type) {
                                                 <td><?php echo htmlspecialchars($row['fuel_type']); ?></td>
                                                 <td><?php echo htmlspecialchars($row['price_per_day']); ?> MWK</td>
                                                 <td><span class="status status-<?php echo strtolower($row['status']); ?>"><?php echo htmlspecialchars($row['status']); ?></span></td>
+                                                <td><?php echo $row['featured'] ? 'Yes' : 'No'; ?></td>
+                                            <?php elseif ($report_type == 'extra_charges'): ?>
+                                                <td><?php echo htmlspecialchars($row['id']); ?></td>
+                                                <td><?php echo htmlspecialchars($row['booking_id']); ?></td>
+                                                <td><?php echo htmlspecialchars($row['days_late']); ?></td>
+                                                <td><?php echo htmlspecialchars($row['extra_cost']); ?> MWK</td>
+                                                <td><?php echo htmlspecialchars($row['created_at']); ?></td>
+                                            <?php elseif ($report_type == 'payments'): ?>
+                                                <td><?php echo htmlspecialchars($row['id']); ?></td>
+                                                <td><?php echo htmlspecialchars($row['user_email'] ?? 'N/A'); ?></td>
+                                                <td><?php echo htmlspecialchars($row['booking_id'] ?? 'N/A'); ?></td>
+                                                <td><?php echo htmlspecialchars($row['tx_ref'] ?? 'N/A'); ?></td>
+                                                <td><?php echo htmlspecialchars($row['amount'] ?? 'N/A'); ?> MWK</td>
+                                                <td><span class="status status-<?php echo strtolower($row['status']); ?>"><?php echo htmlspecialchars($row['status']); ?></span></td>
+                                                <td><?php echo htmlspecialchars($row['type']); ?></td>
+                                                <td><?php echo htmlspecialchars($row['created_at']); ?></td>
+                                                <td><?php echo htmlspecialchars($row['charge_id']); ?></td>
                                             <?php endif; ?>
                                         </tr>
                                     <?php endforeach; ?>
@@ -858,10 +975,10 @@ if ($report_type) {
                     <?php endif; ?>
                 </div>
             </div>
-        </div>
+        </section>
 
         <!-- Profile Section -->
-        <div class="section <?php echo (isset($_GET['section']) && $_GET['section'] == 'profile') ? 'active' : ''; ?>" id="profile">
+        <section class="section <?php echo (isset($_GET['section']) && $_GET['section'] == 'profile') ? 'active' : ''; ?>" id="profile">
             <div class="dashboard-header">
                 <h1>Profile</h1>
             </div>
@@ -870,8 +987,8 @@ if ($report_type) {
                 <div class="user-profile">
                     <div class="profile-image-container">
                         <img src="https://via.placeholder.com/150" alt="Admin Profile Picture" class="profile-image">
-                        <input type="file" id="profile-image-upload" hidden>
-                        <label for="profile-image-upload" class="upload-btn">Change Image</label>
+                        <input type="file" id="profile-image-upload" accept="image/jpeg,image/png,image/gif,image/bmp,image/webp" hidden>
+                        <label for="profile-image-upload" class="upload-btn" aria-label="Change Profile Image">Change Image</label>
                     </div>
                     <div class="details">
                         <div class="profile-info">
@@ -880,43 +997,74 @@ if ($report_type) {
                             <label for="email">Email</label>
                             <input type="email" id="email" value="admin@example.com" disabled>
                             <label for="phone">Phone Number</label>
-                            <input type="text" id="phone" value="+260 999 888 777">
+                            <input type="text" id="phone" value="+260 999 888 777" aria-describedby="phoneError">
+                            <div class="inline-error" id="phoneError"></div>
                             <label for="address">Address</label>
-                            <input type="text" id="address" value="Lusaka, Zambia">
-                            <button onclick="saveProfile()">Save Changes</button>
+                            <input type="text" id="address" value="Lusaka, Zambia" aria-describedby="addressError">
+                            <div class="inline-error" id="addressError"></div>
+                            <button onclick="saveProfile()" aria-label="Save Profile Changes">Save Changes</button>
                         </div>
                     </div>
                 </div>
+            </div>
+        </section>
+    </div>
+
+    <!-- Admin Login Modal -->
+    <div class="modal" id="adminLoginModal" aria-hidden="true">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h3>Admin Login</h3>
+                <span class="close" aria-label="Close Login Modal" <?php echo !isset($_SESSION['admin_id']) ? 'style="pointer-events: none; opacity: 0.5;" aria-disabled="true"' : ''; ?>>×</span>
+            </div>
+            <div class="modal-body">
+                <form id="loginForm">
+                    <input type="email" id="adminEmail" placeholder="Email" required aria-describedby="adminEmailError">
+                    <div class="inline-error" id="adminEmailError"></div>
+                    <input type="password" id="adminPassword" placeholder="Password" required aria-describedby="adminPasswordError">
+                    <div class="inline-error" id="adminPasswordError"></div>
+                    <div class="modal-footer">
+                        <button type="submit" class="action-btn approve" aria-label="Login">Login</button>
+                    </div>
+                </form>
             </div>
         </div>
     </div>
 
     <!-- Add Car Modal -->
-    <div class="modal" id="carModal">
+    <div class="modal" id="carModal" aria-hidden="true">
         <div class="modal-content">
             <div class="modal-header">
                 <h3>Add New Car</h3>
-                <span class="close" onclick="closeModal('carModal')">×</span>
+                <span class="close" aria-label="Close Add Car Modal">×</span>
             </div>
             <div class="modal-body">
-                <form method="POST" enctype="multipart/form-data">
-                    <input type="text" name="name" placeholder="Car Name" required>
-                    <input type="text" name="model" placeholder="Car Model" required>
-                    <input type="text" name="license_plate" placeholder="License Plate" required>
-                    <input type="number" name="capacity" placeholder="Capacity" required min="1" max="10">
-                    <select name="fuel_type" required>
+                <form id="addCarForm" method="POST" enctype="multipart/form-data">
+                    <input type="hidden" name="csrf_token" value="<?php echo generate_csrf_token(); ?>">
+                    <input type="text" name="name" id="addCarName" placeholder="Car Name" required aria-describedby="addCarNameError">
+                    <div class="inline-error" id="addCarNameError"></div>
+                    <input type="text" name="model" id="addCarModel" placeholder="Car Model" required aria-describedby="addCarModelError">
+                    <div class="inline-error" id="addCarModelError"></div>
+                    <input type="text" name="license_plate" id="addCarLicensePlate" placeholder="License Plate" required aria-describedby="addCarLicensePlateError">
+                    <div class="inline-error" id="addCarLicensePlateError"></div>
+                    <input type="number" name="capacity" id="addCarCapacity" placeholder="Capacity" required min="1" max="10" aria-describedby="addCarCapacityError">
+                    <div class="inline-error" id="addCarCapacityError"></div>
+                    <select name="fuel_type" id="addCarFuelType" required aria-describedby="addCarFuelTypeError">
                         <option value="" disabled selected>Select Fuel Type</option>
                         <option value="Petrol">Petrol</option>
                         <option value="Diesel">Diesel</option>
                         <option value="Hybrid">Hybrid</option>
                         <option value="Electric">Electric</option>
                     </select>
-                    <input type="number" name="price_per_day" placeholder="Price per Day (MWK)" step="0.01" required>
-                    <label><input type="checkbox" name="featured"> Featured Car</label>
-                    <input type="file" name="image" accept="image/jpeg,image/png,image/gif,image/bmp,image/webp" required>
+                    <div class="inline-error" id="addCarFuelTypeError"></div>
+                    <input type="number" name="price_per_day" id="addCarPricePerDay" placeholder="Price per Day (MWK)" step="0.01" required min="0" aria-describedby="addCarPricePerDayError">
+                    <div class="inline-error" id="addCarPricePerDayError"></div>
+                    <label><input type="checkbox" name="featured" id="addCarFeatured"> Featured Car</label>
+                    <input type="file" name="image" id="addCarImage" accept="image/jpeg,image/png,image/gif,image/bmp,image/webp" aria-describedby="addCarImageError">
+                    <div class="inline-error" id="addCarImageError"></div>
                     <div class="modal-footer">
-                        <button type="button" class="action-btn" onclick="closeModal('carModal')">Cancel</button>
-                        <button type="submit" name="add_car" class="action-btn approve">Add Car</button>
+                        <button type="button" class="action-btn" onclick="closeModal('carModal')" aria-label="Cancel">Cancel</button>
+                        <button type="submit" name="add_car" class="action-btn approve" onclick="return confirm('Are you sure you want to add this car?')" aria-label="Add Car">Add Car</button>
                     </div>
                 </form>
             </div>
@@ -924,32 +1072,40 @@ if ($report_type) {
     </div>
 
     <!-- Edit Car Modal -->
-    <div class="modal" id="editCarModal">
+    <div class="modal" id="editCarModal" aria-hidden="true">
         <div class="modal-content">
             <div class="modal-header">
                 <h3>Edit Car</h3>
-                <span class="close" onclick="closeModal('editCarModal')">×</span>
+                <span class="close" aria-label="Close Edit Car Modal">×</span>
             </div>
             <div class="modal-body">
-                <form method="POST" enctype="multipart/form-data">
+                <form id="editCarForm" method="POST" enctype="multipart/form-data">
+                    <input type="hidden" name="csrf_token" value="<?php echo generate_csrf_token(); ?>">
                     <input type="hidden" name="car_id" id="editCarId">
-                    <input type="text" name="name" id="editCarName" placeholder="Car Name" required>
-                    <input type="text" name="model" id="editCarModel" placeholder="Car Model" required>
-                    <input type="text" name="license_plate" id="editCarLicensePlate" placeholder="License Plate" required>
-                    <input type="number" name="capacity" id="editCarCapacity" placeholder="Capacity" required min="1" max="10">
-                    <select name="fuel_type" id="editCarFuelType" required>
+                    <input type="text" name="name" id="editCarName" placeholder="Car Name" required aria-describedby="editCarNameError">
+                    <div class="inline-error" id="editCarNameError"></div>
+                    <input type="text" name="model" id="editCarModel" placeholder="Car Model" required aria-describedby="editCarModelError">
+                    <div class="inline-error" id="editCarModelError"></div>
+                    <input type="text" name="license_plate" id="editCarLicensePlate" placeholder="License Plate" required aria-describedby="editCarLicensePlateError">
+                    <div class="inline-error" id="editCarLicensePlateError"></div>
+                    <input type="number" name="capacity" id="editCarCapacity" placeholder="Capacity" required min="1" max="10" aria-describedby="editCarCapacityError">
+                    <div class="inline-error" id="editCarCapacityError"></div>
+                    <select name="fuel_type" id="editCarFuelType" required aria-describedby="editCarFuelTypeError">
                         <option value="" disabled>Select Fuel Type</option>
                         <option value="Petrol">Petrol</option>
                         <option value="Diesel">Diesel</option>
                         <option value="Hybrid">Hybrid</option>
                         <option value="Electric">Electric</option>
                     </select>
-                    <input type="number" name="price_per_day" id="editCarPricePerDay" placeholder="Price per Day (MWK)" step="0.01" required>
+                    <div class="inline-error" id="editCarFuelTypeError"></div>
+                    <input type="number" name="price_per_day" id="editCarPricePerDay" placeholder="Price per Day (MWK)" step="0.01" required min="0" aria-describedby="editCarPricePerDayError">
+                    <div class="inline-error" id="editCarPricePerDayError"></div>
                     <label><input type="checkbox" name="featured" id="editCarFeatured"> Featured Car</label>
-                    <input type="file" name="image" accept="image/jpeg,image/png,image/gif,image/bmp,image/webp">
+                    <input type="file" name="image" id="editCarImage" accept="image/jpeg,image/png,image/gif,image/bmp,image/webp" aria-describedby="editCarImageError">
+                    <div class="inline-error" id="editCarImageError"></div>
                     <div class="modal-footer">
-                        <button type="button" class="action-btn" onclick="closeModal('editCarModal')">Cancel</button>
-                        <button type="submit" name="update_car" class="action-btn approve">Update Car</button>
+                        <button type="button" class="action-btn" onclick="closeModal('editCarModal')" aria-label="Cancel">Cancel</button>
+                        <button type="submit" name="update_car" class="action-btn approve" onclick="return confirm('Are you sure you want to update this car?')" aria-label="Update Car">Update Car</button>
                     </div>
                 </form>
             </div>
@@ -957,167 +1113,311 @@ if ($report_type) {
     </div>
 
     <!-- Edit User Modal -->
-    <div class="modal" id="editUserModal">
+    <div class="modal" id="editUserModal" aria-hidden="true">
         <div class="modal-content">
             <div class="modal-header">
                 <h3>Edit User</h3>
-                <span class="close" onclick="closeModal('editUserModal')">×</span>
+                <span class="close" aria-label="Close Edit User Modal">×</span>
             </div>
             <div class="modal-body">
-                <form method="POST">
+                <form id="editUserForm" method="POST">
+                    <input type="hidden" name="csrf_token" value="<?php echo generate_csrf_token(); ?>">
                     <input type="hidden" name="user_id" id="editUserId">
-                    <input type="email" name="email" id="editUserEmail" placeholder="Email" required>
-                    <input type="text" name="phone" id="editUserPhone" placeholder="Phone Number" required>
-                    <select name="gender" id="editUserGender" required>
+                    <input type="text" name="username" id="editUserUsername" placeholder="Username" required aria-describedby="editUserUsernameError">
+                    <div class="inline-error" id="editUserUsernameError"></div>
+                    <input type="email" name="email" id="editUserEmail" placeholder="Email" required aria-describedby="editUserEmailError">
+                    <div class="inline-error" id="editUserEmailError"></div>
+                    <input type="text" name="phone" id="editUserPhone" placeholder="Phone Number" required aria-describedby="editUserPhoneError">
+                    <div class="inline-error" id="editUserPhoneError"></div>
+                    <select name="gender" id="editUserGender" required aria-describedby="editUserGenderError">
                         <option value="" disabled>Select Gender</option>
                         <option value="Male">Male</option>
                         <option value="Female">Female</option>
                         <option value="Other">Other</option>
                     </select>
-                    <input type="text" name="address" id="editUserAddress" placeholder="Address" required>
-                    <input type="text" name="location" id="editUserLocation" placeholder="Location" required>
-                    <input type="text" name="kin_name" id="editUserKinName" placeholder="Next of Kin Name">
-                    <input type="text" name="kin_relationship" id="editUserKinRelationship" placeholder="Kin Relationship">
-                    <input type="text" name="kin_phone" id="editUserKinPhone" placeholder="Kin Phone">
-                    <select name="status" id="editUserStatus" required>
+                    <div class="inline-error" id="editUserGenderError"></div>
+                    <input type="number" name="age" id="editUserAge" placeholder="Age" required min="18" aria-describedby="editUserAgeError">
+                    <div class="inline-error" id="editUserAgeError"></div>
+                    <input type="text" name="address" id="editUserAddress" placeholder="Address" required aria-describedby="editUserAddressError">
+                    <div class="inline-error" id="editUserAddressError"></div>
+                    <input type="text" name="location" id="editUserLocation" placeholder="Location" required aria-describedby="editUserLocationError">
+                    <div class="inline-error" id="editUserLocationError"></div>
+                    <input type="text" name="kin_name" id="editUserKinName" placeholder="Next of Kin Name" aria-describedby="editUserKinNameError">
+                    <div class="inline-error" id="editUserKinNameError"></div>
+                    <input type="text" name="kin_relationship" id="editUserKinRelationship" placeholder="Kin Relationship" aria-describedby="editUserKinRelationshipError">
+                    <div class="inline-error" id="editUserKinRelationshipError"></div>
+                    <input type="text" name="kin_phone" id="editUserKinPhone" placeholder="Kin Phone" aria-describedby="editUserKinPhoneError">
+                    <div class="inline-error" id="editUserKinPhoneError"></div>
+                    <select name="status" id="editUserStatus" required aria-describedby="editUserStatusError">
                         <option value="" disabled>Select Status</option>
                         <option value="pending">Pending</option>
                         <option value="approved">Approved</option>
                         <option value="declined">Declined</option>
                     </select>
+                    <div class="inline-error" id="editUserStatusError"></div>
                     <div class="modal-footer">
-                        <button type="button" class="action-btn" onclick="closeModal('editUserModal')">Cancel</button>
-                        <button type="submit" name="update_user" class="action-btn approve">Update User</button>
+                        <button type="button" class="action-btn" onclick="closeModal('editUserModal')" aria-label="Cancel">Cancel</button>
+                        <button type="submit" name="update_user" class="action-btn approve" onclick="return confirm('Are you sure you want to update this user?')" aria-label="Update User">Update User</button>
                     </div>
                 </form>
             </div>
         </div>
     </div>
 
-    <div class="footer">
-        <p>© 2025 Mibesa. All rights reserved.</p>
+    <!-- Rejection Reason Modal -->
+    <div class="modal" id="rejectionModal" aria-hidden="true">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h3>Decline User</h3>
+                <span class="close" aria-label="Close Rejection Modal">×</span>
+            </div>
+            <div class="modal-body">
+                <form id="rejectionForm" method="POST">
+                    <input type="hidden" name="csrf_token" value="<?php echo generate_csrf_token(); ?>">
+                    <input type="hidden" name="user_id" id="rejectUserId">
+                    <input type="hidden" name="user_action" value="declined">
+                    <textarea name="rejection_reason" id="rejectionReason" placeholder="Enter reason for declining the user" required aria-describedby="rejectionReasonError"></textarea>
+                    <div class="inline-error" id="rejectionReasonError"></div>
+                    <div class="modal-footer">
+                        <button type="button" class="action-btn" onclick="closeModal('rejectionModal')" aria-label="Cancel">Cancel</button>
+                        <button type="submit" class="action-btn decline" aria-label="Submit Rejection">Decline User</button>
+                    </div>
+                </form>
+            </div>
+        </div>
     </div>
 
+    <footer class="footer">
+        <p>© 2025 Mibesa CarRental. All rights reserved.</p>
+    </footer>
+
     <script>
-        // Toggle sidebar function
-        function toggleSidebar() {
-            document.getElementById('sidebar').classList.toggle('collapsed');
-            document.getElementById('content').classList.toggle('collapsed');
-            document.getElementById('topbar').classList.toggle('collapsed');
-        }
+        document.addEventListener('DOMContentLoaded', () => {
+            // Initialize page
+            const urlParams = new URLSearchParams(window.location.search);
+            const section = urlParams.get('section') || 'dashboard';
+            showSection(section);
 
-        // Show section function
-        function showSection(sectionId) {
-            const sections = document.querySelectorAll('.section');
-            sections.forEach(section => section.classList.remove('active'));
-            document.getElementById(sectionId).classList.add('active');
-            if (sectionId === 'reports') {
-                document.getElementById('reportType').value = '<?php echo htmlspecialchars($report_type); ?>';
+            // Auto-hide messages
+            document.querySelectorAll('.alert, .success').forEach(msg => {
+                msg.style.display = 'block';
+                setTimeout(() => msg.style.display = 'none', 5000);
+            });
+
+            // Show login modal if not logged in
+            const isAdminLoggedIn = <?php echo isset($_SESSION['admin_id']) ? 'true' : 'false'; ?>;
+            if (!isAdminLoggedIn) {
+                openModal('adminLoginModal');
+                lockLoginModal();
             }
-        }
+        });
 
-        // Modal functions
-        function openModal(modalId) {
-            document.getElementById(modalId).style.display = 'flex';
-        }
+// Toggle Sidebar
+function toggleSidebar() {
+    const sidebar = document.getElementById('sidebar');
+    const content = document.getElementById('content');
+    const topbar = document.getElementById('topbar');
+    sidebar.classList.toggle('collapsed');
+    content.classList.toggle('collapsed');
+    topbar.classList.toggle('collapsed');
+}
 
-        function closeModal(modalId) {
-            document.getElementById(modalId).style.display = 'none';
-        }
+// Show Section
+function showSection(sectionId) {
+    document.querySelectorAll('.section').forEach(section => {
+        section.classList.remove('active');
+    });
+    document.getElementById(sectionId).classList.add('active');
 
-        // Edit car modal
-        function openEditCarModal(car) {
-            document.getElementById('editCarId').value = car.id;
-            document.getElementById('editCarName').value = car.name;
-            document.getElementById('editCarModel').value = car.model;
-            document.getElementById('editCarLicensePlate').value = car.license_plate;
-            document.getElementById('editCarCapacity').value = car.capacity;
-            document.getElementById('editCarFuelType').value = car.fuel_type;
-            document.getElementById('editCarPricePerDay').value = car.price_per_day || 50;
-            document.getElementById('editCarFeatured').checked = car.featured == 1;
-            openModal('editCarModal');
-        }
+    // Update URL
+    const url = new URL(window.location);
+    url.searchParams.set('section', sectionId);
+    history.pushState({}, '', url);
+}
 
-        // Edit user modal
-        function openEditUserModal(user) {
-            document.getElementById('editUserId').value = user.id;
-            document.getElementById('editUserEmail').value = user.email;
-            document.getElementById('editUserPhone').value = user.phone;
-            document.getElementById('editUserGender').value = user.gender;
-            document.getElementById('editUserAddress').value = user.address;
-            document.getElementById('editUserLocation').value = user.location;
-            document.getElementById('editUserKinName').value = user.kin_name || '';
-            document.getElementById('editUserKinRelationship').value = user.kin_relationship || '';
-            document.getElementById('editUserKinPhone').value = user.kin_phone || '';
-            document.getElementById('editUserStatus').value = user.status;
-            openModal('editUserModal');
-        }
+// Modal Functions
+function openModal(modalId) {
+    document.getElementById(modalId).style.display = 'flex';
+    document.getElementById(modalId).setAttribute('aria-hidden', 'false');
+}
 
-        // Profile functions
-        function saveProfile() {
-            alert('Profile changes saved successfully!');
-        }
+function closeModal(modalId) {
+    document.getElementById(modalId).style.display = 'none';
+    document.getElementById(modalId).setAttribute('aria-hidden', 'true');
+}
 
-        // Search and filter functions
-        function applyCarSearchFilter() {
-            const search = document.getElementById('carSearch').value;
-            const filter = document.getElementById('carFilter').value;
-            window.location.href = `admin_dashboard.php?section=manage-cars&search=${encodeURIComponent(search)}&filter=${filter}`;
-        }
+function lockLoginModal() {
+    const loginModal = document.getElementById('adminLoginModal');
+    const closeButton = loginModal.querySelector('.close');
+    closeButton.style.pointerEvents = 'none';
+    closeButton.style.opacity = '0.5';
+    closeButton.setAttribute('aria-disabled', 'true');
+}
 
-        function applyUserSearchFilter() {
-            const search = document.getElementById('userSearch').value;
-            const filter = document.getElementById('userFilter').value;
-            window.location.href = `admin_dashboard.php?section=manage-users&search=${encodeURIComponent(search)}&filter=${filter}`;
-        }
+// Search and Filter Functions
+function applyUserSearchFilter() {
+    const search = document.getElementById('userSearch').value;
+    const filter = document.getElementById('userFilter').value;
+    window.location.href = `admin_dashboard.php?section=manage-users&search=${encodeURIComponent(search)}&filter=${filter}`;
+}
 
-        function applyBookingSearchFilter() {
-            const search = document.getElementById('bookingSearch').value;
-            const filter = document.getElementById('bookingFilter').value;
-            window.location.href = `admin_dashboard.php?section=manage-bookings&search=${encodeURIComponent(search)}&filter=${filter}`;
-        }
+function applyCarSearchFilter() {
+    const search = document.getElementById('carSearch').value;
+    const filter = document.getElementById('carFilter').value;
+    window.location.href = `admin_dashboard.php?section=manage-cars&search=${encodeURIComponent(search)}&filter=${filter}`;
+}
 
-        // Report generation
-        function generateReport() {
-            const reportType = document.getElementById('reportType').value;
-            const search = document.getElementById('reportSearch')?.value || '';
-            if (reportType) {
-                window.location.href = `admin_dashboard.php?section=reports&report_type=${reportType}&search=${encodeURIComponent(search)}`;
+function applyBookingSearchFilter() {
+    const search = document.getElementById('bookingSearch').value;
+    const filter = document.getElementById('bookingFilter').value;
+    window.location.href = `admin_dashboard.php?section=manage-bookings&search=${encodeURIComponent(search)}&filter=${filter}`;
+}
+
+// Edit Car Modal
+function openEditCarModal(car) {
+    document.getElementById('editCarId').value = car.id;
+    document.getElementById('editCarName').value = car.name;
+    document.getElementById('editCarModel').value = car.model;
+    document.getElementById('editCarLicensePlate').value = car.license_plate;
+    document.getElementById('editCarCapacity').value = car.capacity;
+    document.getElementById('editCarFuelType').value = car.fuel_type;
+    document.getElementById('editCarPricePerDay').value = car.price_per_day;
+    document.getElementById('editCarFeatured').checked = car.featured == 1;
+    openModal('editCarModal');
+}
+
+// Edit User Modal
+function openEditUserModal(user) {
+    document.getElementById('editUserId').value = user.id;
+    document.getElementById('editUserUsername').value = user.username;
+    document.getElementById('editUserEmail').value = user.email;
+    document.getElementById('editUserPhone').value = user.phone;
+    document.getElementById('editUserGender').value = user.gender;
+    document.getElementById('editUserAge').value = user.age;
+    document.getElementById('editUserAddress').value = user.address;
+    document.getElementById('editUserLocation').value = user.location;
+    document.getElementById('editUserKinName').value = user.kin_name || '';
+    document.getElementById('editUserKinRelationship').value = user.kin_relationship || '';
+    document.getElementById('editUserKinPhone').value = user.kin_phone || '';
+    document.getElementById('editUserStatus').value = user.status;
+    openModal('editUserModal');
+}
+
+// Rejection Modal
+function openRejectionModal(userId) {
+    document.getElementById('rejectUserId').value = userId;
+    openModal('rejectionModal');
+}
+
+// Download National ID
+function downloadNationalId(base64Data, filename) {
+    const link = document.createElement('a');
+    link.href = base64Data;
+    link.download = `${filename}_national_id.pdf`;
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+}
+
+// Save Profile
+function saveProfile() {
+    const phone = document.getElementById('phone').value;
+    const address = document.getElementById('address').value;
+    const phoneError = document.getElementById('phoneError');
+    const addressError = document.getElementById('addressError');
+
+    let valid = true;
+    phoneError.style.display = 'none';
+    addressError.style.display = 'none';
+
+    if (!phone.match(/^0[0-9]{9}$/)) {
+        phoneError.textContent = 'Phone number must be 10 digits starting with 0.';
+        phoneError.style.display = 'block';
+        valid = false;
+    }
+    if (!address.trim()) {
+        addressError.textContent = 'Address is required.';
+        addressError.style.display = 'block';
+        valid = false;
+    }
+
+    if (valid) {
+        // Simulate AJAX call to save profile
+        alert('Profile saved successfully!');
+    }
+}
+
+// Admin Login
+document.getElementById('loginForm').addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const email = document.getElementById('adminEmail').value;
+    const password = document.getElementById('adminPassword').value;
+    const emailError = document.getElementById('adminEmailError');
+    const passwordError = document.getElementById('adminPasswordError');
+
+    emailError.style.display = 'none';
+    passwordError.style.display = 'none';
+
+    try {
+        const response = await fetch('admin_login.php', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ email, password })
+        });
+        const result = await response.json();
+
+        if (result.success) {
+            closeModal('adminLoginModal');
+            window.location.reload();
+        } else {
+            if (result.error.includes('email')) {
+                emailError.textContent = result.error;
+                emailError.style.display = 'block';
             } else {
-                alert('Please select a report type.');
+                passwordError.textContent = result.error;
+                passwordError.style.display = 'block';
             }
         }
+    } catch (error) {
+        passwordError.textContent = 'An error occurred. Please try again.';
+        passwordError.style.display = 'block';
+    }
+});
 
-        // Download National ID
-        function downloadNationalId(base64Data, filename) {
-            const link = document.createElement('a');
-            link.href = `data:application/pdf;base64,${base64Data}`;
-            link.download = `national_id_${filename}.pdf`;
-            document.body.appendChild(link);
-            link.click();
-            document.body.removeChild(link);
-        }
-
-        // Logout function
-        function logout() {
-            if (confirm('Are you sure you want to logout?')) {
-                window.location.href = 'logout.php';
+// Logout
+async function logout() {
+    if (confirm('Are you sure you want to logout?')) {
+        try {
+            const response = await fetch('admin_logout.php', { method: 'POST' });
+            const result = await response.json();
+            if (result.success) {
+                window.location.href = 'admin_dashboard.php';
             }
+        } catch (error) {
+            alert('Error during logout. Please try again.');
         }
+    }
+}
 
-        // Dashboard slider
-        let slideIndex = 0;
-        const slides = document.querySelectorAll('.slide');
-        function showSlides() {
-            slides.forEach(slide => slide.classList.remove('active'));
-            slideIndex = (slideIndex + 1) % slides.length;
-            slides[slideIndex].classList.add('active');
-            setTimeout(showSlides, 3000);
+// Close Modal on Outside Click (except login modal when not logged in)
+window.addEventListener('click', (e) => {
+    const modals = document.querySelectorAll('.modal');
+    modals.forEach(modal => {
+        if (e.target === modal && modal.id !== 'adminLoginModal') {
+            closeModal(modal.id);
         }
-        if (slides.length > 0) {
-            slides[0].classList.add('active');
-            showSlides();
+    });
+});
+
+// Close Modal with Close Button
+document.querySelectorAll('.close').forEach(closeBtn => {
+    closeBtn.addEventListener('click', () => {
+        const modal = closeBtn.closest('.modal');
+        if (modal.id !== 'adminLoginModal' || closeBtn.style.pointerEvents !== 'none') {
+            closeModal(modal.id);
         }
-    </script>
+    });
+});
+</script>
 </body>
 </html>
