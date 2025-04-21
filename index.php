@@ -122,7 +122,7 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_POST['signup'])) {
                     'profile_picture_path' => $profile_picture_path
                 ];
 
-                $payment = initiateUSSDPayment($pdo, 0, 500, 'signup', null, $_SESSION['temp_signup_data']);
+                $payment = initiateUSSDPayment($pdo, 0, 50, 'signup', null, $_SESSION['temp_signup_data']);
                 if (isset($payment['error'])) {
                     $payment_error = $payment['error'];
                     $payment_type = $payment['type'];
