@@ -4,6 +4,12 @@ if (session_status() === PHP_SESSION_NONE) {
     session_start();
 }
 
+// Redirect to login if not authenticated
+if (!isset($_SESSION['admin_id'])) {
+    header("Location: admin_login.php");
+    exit;
+}
+
 // CSRF Token Functions
 function generate_csrf_token() {
     if (empty($_SESSION['csrf_token'])) {
@@ -16,12 +22,73 @@ function verify_csrf_token($token) {
     return isset($_SESSION['csrf_token']) && hash_equals($_SESSION['csrf_token'], $token);
 }
 
-// Handle user approval/decline
-if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_POST['user_action'])) {
-    if (!isset($_SESSION['admin_id'])) {
-        header("Location: admin_dashboard.php?error=" . urlencode("Please log in to perform this action"));
+// Fetch admin profile
+$stmt = $pdo->prepare("SELECT name, email, phone, address, profile_image FROM admins WHERE id = ?");
+$stmt->execute([$_SESSION['admin_id']]);
+$admin = $stmt->fetch();
+$admin['name'] = $admin['name'] ?? 'Admin';
+$admin['email'] = $admin['email'] ?? 'admin@example.com';
+$admin['phone'] = $admin['phone'] ?? '+260 999 888 777';
+$admin['address'] = $admin['address'] ?? 'Lusaka, Zambia';
+$admin['profile_image'] = $admin['profile_image'] && strpos($admin['profile_image'], 'data:image/') === 0 
+    ? $admin['profile_image'] 
+    : 'https://via.placeholder.com/150';
+
+// Handle profile update
+if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_POST['update_profile'])) {
+    $name = trim($_POST['name']);
+    $email = trim($_POST['email']);
+    $phone = trim($_POST['phone']);
+    $address = trim($_POST['address']);
+    $csrf_token = $_POST['csrf_token'];
+
+    if (!verify_csrf_token($csrf_token)) {
+        header("Location: admin_dashboard.php?section=profile&error=" . urlencode("Invalid CSRF token"));
         exit;
     }
+
+    $errors = [];
+    if (empty($name)) {
+        $errors[] = "Name is required.";
+    }
+    if (empty($email) || !filter_var($email, FILTER_VALIDATE_EMAIL)) {
+        $errors[] = "A valid email is required.";
+    }
+    if (empty($phone) || !preg_match('/^0[0-9]{9}$/', $phone)) {
+        $errors[] = "Phone number must be 10 digits starting with 0.";
+    }
+    if (empty($address)) {
+        $errors[] = "Address is required.";
+    }
+
+    $imageBase64 = $admin['profile_image'];
+    if (isset($_FILES['profile_image']) && $_FILES['profile_image']['error'] === UPLOAD_ERR_OK) {
+        $allowedTypes = ['image/jpeg', 'image/png', 'image/gif', 'image/bmp', 'image/webp'];
+        $maxSize = 2 * 1024 * 1024;
+        $fileType = $_FILES['profile_image']['type'];
+        $fileSize = $_FILES['profile_image']['size'];
+
+        if (in_array($fileType, $allowedTypes) && $fileSize <= $maxSize) {
+            $imageData = file_get_contents($_FILES['profile_image']['tmp_name']);
+            $imageBase64 = 'data:' . $fileType . ';base64,' . base64_encode($imageData);
+        } else {
+            $errors[] = "Invalid image type or size (max 2MB).";
+        }
+    }
+
+    if (empty($errors)) {
+        $stmt = $pdo->prepare("UPDATE admins SET name = ?, email = ?, phone = ?, address = ?, profile_image = ? WHERE id = ?");
+        $stmt->execute([$name, $email, $phone, $address, $imageBase64, $_SESSION['admin_id']]);
+        header("Location: admin_dashboard.php?section=profile&message=" . urlencode("Profile updated successfully"));
+        exit;
+    } else {
+        header("Location: admin_dashboard.php?section=profile&error=" . urlencode(implode(" ", $errors)));
+        exit;
+    }
+}
+
+// Handle user approval/decline
+if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_POST['user_action'])) {
     $user_id = $_POST['user_id'];
     $action = $_POST['action'];
     $csrf_token = $_POST['csrf_token'];
@@ -50,10 +117,6 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_POST['user_action'])) {
 
 // Handle user deletion
 if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_POST['delete_user'])) {
-    if (!isset($_SESSION['admin_id'])) {
-        header("Location: admin_dashboard.php?error=" . urlencode("Please log in to perform this action"));
-        exit;
-    }
     $user_id = $_POST['user_id'];
     $csrf_token = $_POST['csrf_token'];
 
@@ -62,7 +125,6 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_POST['delete_user'])) {
         exit;
     }
 
-    // Check for dependent payments
     $stmt = $pdo->prepare("SELECT COUNT(*) FROM payments WHERE user_id = ?");
     $stmt->execute([$user_id]);
     $payment_count = $stmt->fetchColumn();
@@ -87,11 +149,10 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_POST['delete_user'])) {
 
 // Handle user update
 if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_POST['update_user'])) {
-    if (!isset($_SESSION['admin_id'])) {
-        header("Location: admin_dashboard.php?error=" . urlencode("Please log in to perform this action"));
-        exit;
-    }
     $user_id = $_POST['user_id'];
+    $first_name = trim($_POST['first_name']);
+    $last_name = trim($_POST['last_name']);
+    $occupation = trim($_POST['occupation']);
     $email = trim($_POST['email']);
     $phone = trim($_POST['phone']);
     $gender = $_POST['gender'];
@@ -111,6 +172,12 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_POST['update_user'])) {
     }
 
     $errors = [];
+    if (empty($first_name)) {
+        $errors[] = "First name is required.";
+    }
+    if (empty($last_name)) {
+        $errors[] = "Last name is required.";
+    }
     if (empty($email) || !filter_var($email, FILTER_VALIDATE_EMAIL)) {
         $errors[] = "A valid email is required.";
     }
@@ -137,8 +204,8 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_POST['update_user'])) {
     }
 
     if (empty($errors)) {
-        $stmt = $pdo->prepare("UPDATE users SET email = ?, phone = ?, gender = ?, address = ?, location = ?, kin_name = ?, kin_relationship = ?, kin_phone = ?, status = ?, username = ?, age = ? WHERE id = ?");
-        $stmt->execute([$email, $phone, $gender, $address, $location, $kin_name, $kin_relationship, $kin_phone, $status, $username, $age, $user_id]);
+        $stmt = $pdo->prepare("UPDATE users SET first_name = ?, last_name = ?, occupation = ?, email = ?, phone = ?, gender = ?, address = ?, location = ?, kin_name = ?, kin_relationship = ?, kin_phone = ?, status = ?, username = ?, age = ? WHERE id = ?");
+        $stmt->execute([$first_name, $last_name, $occupation, $email, $phone, $gender, $address, $location, $kin_name, $kin_relationship, $kin_phone, $status, $username, $age, $user_id]);
 
         sendEmail($email, "Profile Updated", "Your CarRental account details have been updated by an administrator.");
 
@@ -152,10 +219,6 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_POST['update_user'])) {
 
 // Handle car addition
 if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_POST['add_car'])) {
-    if (!isset($_SESSION['admin_id'])) {
-        header("Location: admin_dashboard.php?error=" . urlencode("Please log in to perform this action"));
-        exit;
-    }
     $name = $_POST['name'];
     $model = $_POST['model'];
     $license_plate = $_POST['license_plate'];
@@ -195,10 +258,6 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_POST['add_car'])) {
 
 // Handle car update
 if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_POST['update_car'])) {
-    if (!isset($_SESSION['admin_id'])) {
-        header("Location: admin_dashboard.php?error=" . urlencode("Please log in to perform this action"));
-        exit;
-    }
     $car_id = $_POST['car_id'];
     $name = $_POST['name'];
     $model = $_POST['model'];
@@ -240,10 +299,6 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_POST['update_car'])) {
 
 // Handle car deletion
 if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_POST['delete_car'])) {
-    if (!isset($_SESSION['admin_id'])) {
-        header("Location: admin_dashboard.php?error=" . urlencode("Please log in to perform this action"));
-        exit;
-    }
     $car_id = $_POST['car_id'];
     $csrf_token = $_POST['csrf_token'];
 
@@ -260,10 +315,6 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_POST['delete_car'])) {
 
 // Handle booking approval/decline
 if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_POST['booking_id'], $_POST['action'], $_POST['csrf_token'])) {
-    if (!isset($_SESSION['admin_id'])) {
-        header("Location: admin_dashboard.php?error=" . urlencode("Please log in to perform this action"));
-        exit;
-    }
     $booking_id = $_POST['booking_id'];
     $action = $_POST['action'];
     $csrf_token = $_POST['csrf_token'];
@@ -315,8 +366,9 @@ $filter = isset($_GET['filter']) ? $_GET['filter'] : 'all';
 // Users
 $usersQuery = "SELECT u.* 
                FROM users u 
-               WHERE u.email LIKE ? OR u.address LIKE ? OR u.location LIKE ? OR u.kin_name LIKE ? OR u.kin_phone LIKE ? OR u.username LIKE ?";
-$usersParams = ["%$search%", "%$search%", "%$search%", "%$search%", "%$search%", "%$search%"];
+               WHERE u.email LIKE ? OR u.address LIKE ? OR u.location LIKE ? OR u.kin_name LIKE ? OR u.kin_phone LIKE ? OR u.username LIKE ? 
+               OR COALESCE(u.first_name, '') LIKE ? OR COALESCE(u.last_name, '') LIKE ? OR COALESCE(u.occupation, '') LIKE ?";
+$usersParams = ["%$search%", "%$search%", "%$search%", "%$search%", "%$search%", "%$search%", "%$search%", "%$search%", "%$search%"];
 if ($filter != 'all') {
     $usersQuery .= " AND u.status = ?";
     $usersParams[] = $filter;
@@ -351,16 +403,6 @@ $bookingsStmt = $pdo->prepare($bookingsQuery);
 $bookingsStmt->execute($bookingsParams);
 $bookings = $bookingsStmt->fetchAll();
 
-// Extra Charges
-$extraChargesQuery = "SELECT e.*, b.booking_id 
-                     FROM extra_charges e 
-                     JOIN bookings b ON e.booking_id = b.id 
-                     WHERE b.booking_id LIKE ?";
-$extraChargesParams = ["%$search%"];
-$extraChargesStmt = $pdo->prepare($extraChargesQuery);
-$extraChargesStmt->execute($extraChargesParams);
-$extra_charges = $extraChargesStmt->fetchAll();
-
 // Payments
 $paymentsQuery = "SELECT p.*, u.email AS user_email, b.booking_id 
                  FROM payments p 
@@ -378,10 +420,11 @@ $report_data = [];
 if ($report_type) {
     switch ($report_type) {
         case 'users':
-            $stmt = $pdo->prepare("SELECT u.username, u.email, u.phone, u.gender, u.address, u.location, u.kin_name, u.kin_relationship, u.kin_phone, u.status, u.age 
+            $stmt = $pdo->prepare("SELECT u.first_name, u.last_name, u.occupation, u.username, u.email, u.phone, u.gender, u.address, u.location, u.kin_name, u.kin_relationship, u.kin_phone, u.status, u.age 
                                    FROM users u 
-                                   WHERE u.email LIKE ? OR u.address LIKE ? OR u.location LIKE ? OR u.kin_name LIKE ? OR u.kin_phone LIKE ? OR u.username LIKE ?");
-            $stmt->execute(["%$search%", "%$search%", "%$search%", "%$search%", "%$search%", "%$search%"]);
+                                   WHERE u.email LIKE ? OR u.address LIKE ? OR u.location LIKE ? OR u.kin_name LIKE ? OR u.kin_phone LIKE ? OR u.username LIKE ? 
+                                   OR COALESCE(u.first_name, '') LIKE ? OR COALESCE(u.last_name, '') LIKE ? OR COALESCE(u.occupation, '') LIKE ?");
+            $stmt->execute(["%$search%", "%$search%", "%$search%", "%$search%", "%$search%", "%$search%", "%$search%", "%$search%", "%$search%"]);
             $report_data = $stmt->fetchAll();
             break;
         case 'bookings':
@@ -400,12 +443,12 @@ if ($report_type) {
             $stmt->execute(["%$search%", "%$search%", "%$search%"]);
             $report_data = $stmt->fetchAll();
             break;
-        case 'extra_charges':
-            $stmt = $pdo->prepare("SELECT e.id, b.booking_id, e.days_late, e.extra_cost, e.created_at 
-                                   FROM extra_charges e 
-                                   JOIN bookings b ON e.booking_id = b.id 
-                                   WHERE b.booking_id LIKE ?");
-            $stmt->execute(["%$search%"]);
+        case 'most_booked_cars':
+            $stmt = $pdo->prepare("SELECT name, model, license_plate, capacity, fuel_type, price_per_day, status, featured, booking_count 
+                                   FROM cars 
+                                   WHERE name LIKE ? OR model LIKE ? OR license_plate LIKE ? 
+                                   ORDER BY booking_count DESC");
+            $stmt->execute(["%$search%", "%$search%", "%$search%"]);
             $report_data = $stmt->fetchAll();
             break;
         case 'payments':
@@ -425,7 +468,6 @@ if ($report_type) {
         header('Content-Disposition: attachment; filename="' . $report_type . '_report_' . date('Ymd') . '.csv"');
         $output = fopen('php://output', 'w');
         
-        // Write headers
         if ($report_data) {
             fputcsv($output, array_keys($report_data[0]));
             foreach ($report_data as $row) {
@@ -503,15 +545,27 @@ if ($report_type) {
         .success { background: #ddffdd; border-left: 6px solid #4caf50; padding: 10px; margin-bottom: 15px; }
         .inline-error { color: #d92d20; font-size: 0.85rem; margin-top: 5px; display: none; }
         .table-container { overflow-x: auto; }
-        .footer { text-align: center; padding: 15px; background-color: #0b0c10; color: #ecf0f1; position: fixed; width: 100%; bottom: 0; left: 0; z-index: 98; font-size: 0.9rem; font-weight: 400; }
+        .footer { text-align: center; padding: 20px; background-color: #0b0c10; color: #ecf0f1; width: 100%; font-size: 0.9rem; font-weight: 400; }
+        .footer a { color: #66fcf1; text-decoration: none; margin: 0 10px; }
+        .footer a:hover { text-decoration: underline; }
+        .footer p { margin: 5px 0; }
         .section { display: none; }
         .section.active { display: block; }
         .national-id-links a { color: #45a29e; text-decoration: none; margin-right: 10px; }
         .national-id-links a:hover { color: #66fcf1; }
         .export-btn { background-color: #45a29e; color: #fff; }
+        .user-profile { display: flex; gap: 20px; align-items: flex-start; }
+        .profile-image-container { text-align: center; }
+        .profile-image { width: 150px; height: 150px; border-radius: 50%; object-fit: cover; margin-bottom: 10px; }
+        .upload-btn { display: inline-block; padding: 8px 12px; background-color: #0b0c10; color: #66fcf1; border-radius: 6px; cursor: pointer; font-size: 0.85rem; }
+        .details { flex: 1; }
+        .profile-info { display: grid; grid-template-columns: 1fr 1fr; gap: 15px; }
+        .profile-info label { font-weight: 500; color: #2c3e50; margin-bottom: 5px; display: block; }
+        .profile-info input { width: 100%; padding: 10px; border: 1px solid #ddd; border-radius: 6px; }
+        .profile-info button { grid-column: span 2; padding: 10px; background-color: #0b0c10; color: #66fcf1; border: none; border-radius: 6px; cursor: pointer; }
         @media (max-width: 768px) {
             .sidebar { width: 200px; }
-            .sidebar.collapsed { width: 0; }
+            U .sidebar.collapsed { width: 0; }
             .content { margin-left: 200px; width: calc(100% - 200px); }
             .content.collapsed { margin-left: 0; width: 100%; }
             .topbar { left: 200px; }
@@ -522,6 +576,10 @@ if ($report_type) {
             .data-table th, .data-table td { padding: 8px; font-size: 0.85rem; }
             .action-btn { padding: 6px 10px; font-size: 0.8rem; }
             .modal-content { width: 90%; }
+            .footer { font-size: 0.8rem; padding: 15px; }
+            .user-profile { flex-direction: column; align-items: center; }
+            .profile-info { grid-template-columns: 1fr; }
+            .profile-info button { grid-column: span 1; }
         }
     </style>
 </head>
@@ -546,8 +604,8 @@ if ($report_type) {
         </div>
         <div class="user-actions">
             <div class="user-profile-small" onclick="showSection('profile')" aria-label="Admin Profile">
-                <img src="https://via.placeholder.com/80" alt="Admin Profile">
-                <span>Admin</span>
+                <img src="<?php echo htmlspecialchars($admin['profile_image']); ?>" alt="Admin Profile">
+                <span><?php echo htmlspecialchars($admin['name']); ?></span>
             </div>
         </div>
     </div>
@@ -692,7 +750,7 @@ if ($report_type) {
                 <h1>Manage Users</h1>
             </div>
             <div class="controls">
-                <input type="text" placeholder="Search users by email, address, kin name, etc..." id="userSearch" value="<?php echo htmlspecialchars($search); ?>">
+                <input type="text" placeholder="Search users by email, name, occupation, etc..." id="userSearch" value="<?php echo htmlspecialchars($search); ?>">
                 <select id="userFilter">
                     <option value="all" <?php echo $filter == 'all' ? 'selected' : ''; ?>>All</option>
                     <option value="pending" <?php echo $filter == 'pending' ? 'selected' : ''; ?>>Pending</option>
@@ -707,6 +765,9 @@ if ($report_type) {
                     <table class="data-table">
                         <thead>
                             <tr>
+                                <th>First Name</th>
+                                <th>Last Name</th>
+                                <th>Occupation</th>
                                 <th>Username</th>
                                 <th>Email</th>
                                 <th>Phone</th>
@@ -725,6 +786,9 @@ if ($report_type) {
                         <tbody>
                             <?php foreach ($users as $user): ?>
                                 <tr>
+                                    <td><?php echo htmlspecialchars($user['first_name'] ?? 'Unknown'); ?></td>
+                                    <td><?php echo htmlspecialchars($user['last_name'] ?? 'Unknown'); ?></td>
+                                    <td><?php echo htmlspecialchars($user['occupation'] ?? 'N/A'); ?></td>
                                     <td><?php echo htmlspecialchars($user['username']); ?></td>
                                     <td><?php echo htmlspecialchars($user['email']); ?></td>
                                     <td><?php echo htmlspecialchars($user['phone']); ?></td>
@@ -844,7 +908,7 @@ if ($report_type) {
                         <option value="users" <?php echo $report_type == 'users' ? 'selected' : ''; ?>>Users</option>
                         <option value="bookings" <?php echo $report_type == 'bookings' ? 'selected' : ''; ?>>Bookings</option>
                         <option value="cars" <?php echo $report_type == 'cars' ? 'selected' : ''; ?>>Cars</option>
-                        <option value="extra_charges" <?php echo $report_type == 'extra_charges' ? 'selected' : ''; ?>>Extra Charges</option>
+                        <option value="most_booked_cars" <?php echo $report_type == 'most_booked_cars' ? 'selected' : ''; ?>>Most Booked Cars</option>
                         <option value="payments" <?php echo $report_type == 'payments' ? 'selected' : ''; ?>>Payments</option>
                     </select>
                     <input type="text" name="search" id="reportSearch" placeholder="Search report data..." value="<?php echo htmlspecialchars($search); ?>">
@@ -865,6 +929,9 @@ if ($report_type) {
                                 <thead>
                                     <tr>
                                         <?php if ($report_type == 'users'): ?>
+                                            <th>First Name</th>
+                                            <th>Last Name</th>
+                                            <th>Occupation</th>
                                             <th>Username</th>
                                             <th>Email</th>
                                             <th>Phone</th>
@@ -887,7 +954,7 @@ if ($report_type) {
                                             <th>Payment Status</th>
                                             <th>User Email</th>
                                             <th>User Gender</th>
-                                        <?php elseif ($report_type == 'cars'): ?>
+                                        <?php elseif ($report_type == 'cars' || $report_type == 'most_booked_cars'): ?>
                                             <th>Name</th>
                                             <th>Model</th>
                                             <th>License Plate</th>
@@ -896,12 +963,7 @@ if ($report_type) {
                                             <th>Price/Day</th>
                                             <th>Status</th>
                                             <th>Featured</th>
-                                        <?php elseif ($report_type == 'extra_charges'): ?>
-                                            <th>ID</th>
-                                            <th>Booking ID</th>
-                                            <th>Days Late</th>
-                                            <th>Extra Cost</th>
-                                            <th>Created At</th>
+                                            <th>Booking Count</th>
                                         <?php elseif ($report_type == 'payments'): ?>
                                             <th>ID</th>
                                             <th>User Email</th>
@@ -919,6 +981,9 @@ if ($report_type) {
                                     <?php foreach ($report_data as $row): ?>
                                         <tr>
                                             <?php if ($report_type == 'users'): ?>
+                                                <td><?php echo htmlspecialchars($row['first_name'] ?? 'Unknown'); ?></td>
+                                                <td><?php echo htmlspecialchars($row['last_name'] ?? 'Unknown'); ?></td>
+                                                <td><?php echo htmlspecialchars($row['occupation'] ?? 'N/A'); ?></td>
                                                 <td><?php echo htmlspecialchars($row['username']); ?></td>
                                                 <td><?php echo htmlspecialchars($row['email']); ?></td>
                                                 <td><?php echo htmlspecialchars($row['phone']); ?></td>
@@ -941,7 +1006,7 @@ if ($report_type) {
                                                 <td><span class="status status-<?php echo strtolower($row['payment_status']); ?>"><?php echo htmlspecialchars($row['payment_status']); ?></span></td>
                                                 <td><?php echo htmlspecialchars($row['email']); ?></td>
                                                 <td><?php echo htmlspecialchars($row['gender']); ?></td>
-                                            <?php elseif ($report_type == 'cars'): ?>
+                                            <?php elseif ($report_type == 'cars' || $report_type == 'most_booked_cars'): ?>
                                                 <td><?php echo htmlspecialchars($row['name']); ?></td>
                                                 <td><?php echo htmlspecialchars($row['model']); ?></td>
                                                 <td><?php echo htmlspecialchars($row['license_plate']); ?></td>
@@ -950,12 +1015,7 @@ if ($report_type) {
                                                 <td><?php echo htmlspecialchars($row['price_per_day']); ?> MWK</td>
                                                 <td><span class="status status-<?php echo strtolower($row['status']); ?>"><?php echo htmlspecialchars($row['status']); ?></span></td>
                                                 <td><?php echo $row['featured'] ? 'Yes' : 'No'; ?></td>
-                                            <?php elseif ($report_type == 'extra_charges'): ?>
-                                                <td><?php echo htmlspecialchars($row['id']); ?></td>
-                                                <td><?php echo htmlspecialchars($row['booking_id']); ?></td>
-                                                <td><?php echo htmlspecialchars($row['days_late']); ?></td>
-                                                <td><?php echo htmlspecialchars($row['extra_cost']); ?> MWK</td>
-                                                <td><?php echo htmlspecialchars($row['created_at']); ?></td>
+                                                <td><?php echo htmlspecialchars($row['booking_count']); ?></td>
                                             <?php elseif ($report_type == 'payments'): ?>
                                                 <td><?php echo htmlspecialchars($row['id']); ?></td>
                                                 <td><?php echo htmlspecialchars($row['user_email'] ?? 'N/A'); ?></td>
@@ -984,51 +1044,44 @@ if ($report_type) {
             </div>
             <div class="content-card">
                 <h2>Profile Information</h2>
-                <div class="user-profile">
-                    <div class="profile-image-container">
-                        <img src="https://via.placeholder.com/150" alt="Admin Profile Picture" class="profile-image">
-                        <input type="file" id="profile-image-upload" accept="image/jpeg,image/png,image/gif,image/bmp,image/webp" hidden>
-                        <label for="profile-image-upload" class="upload-btn" aria-label="Change Profile Image">Change Image</label>
-                    </div>
-                    <div class="details">
-                        <div class="profile-info">
-                            <label for="name">Name</label>
-                            <input type="text" id="name" value="Admin" disabled>
-                            <label for="email">Email</label>
-                            <input type="email" id="email" value="admin@example.com" disabled>
-                            <label for="phone">Phone Number</label>
-                            <input type="text" id="phone" value="+260 999 888 777" aria-describedby="phoneError">
-                            <div class="inline-error" id="phoneError"></div>
-                            <label for="address">Address</label>
-                            <input type="text" id="address" value="Lusaka, Zambia" aria-describedby="addressError">
-                            <div class="inline-error" id="addressError"></div>
-                            <button onclick="saveProfile()" aria-label="Save Profile Changes">Save Changes</button>
+                <form id="profileForm" method="POST" enctype="multipart/form-data">
+                    <input type="hidden" name="csrf_token" value="<?php echo generate_csrf_token(); ?>">
+                    <div class="user-profile">
+                        <div class="profile-image-container">
+                            <img src="<?php echo htmlspecialchars($admin['profile_image']); ?>" alt="Admin Profile Picture" class="profile-image" id="profileImagePreview">
+                            <input type="file" name="profile_image" id="profileImageUpload" accept="image/jpeg,image/png,image/gif,image/bmp,image/webp" aria-describedby="profileImageError">
+                            <div class="inline-error" id="profileImageError"></div>
+                            <label for="profileImageUpload" class="upload-btn" aria-label="Change Profile Image">Change Image</label>
                         </div>
-                    </div>
-                </div>
-            </div>
-        </section>
-    </div>
-
-    <!-- Admin Login Modal -->
-    <div class="modal" id="adminLoginModal" aria-hidden="true">
-        <div class="modal-content">
-            <div class="modal-header">
-                <h3>Admin Login</h3>
-                <span class="close" aria-label="Close Login Modal" <?php echo !isset($_SESSION['admin_id']) ? 'style="pointer-events: none; opacity: 0.5;" aria-disabled="true"' : ''; ?>>×</span>
-            </div>
-            <div class="modal-body">
-                <form id="loginForm">
-                    <input type="email" id="adminEmail" placeholder="Email" required aria-describedby="adminEmailError">
-                    <div class="inline-error" id="adminEmailError"></div>
-                    <input type="password" id="adminPassword" placeholder="Password" required aria-describedby="adminPasswordError">
-                    <div class="inline-error" id="adminPasswordError"></div>
-                    <div class="modal-footer">
-                        <button type="submit" class="action-btn approve" aria-label="Login">Login</button>
+                        <div class="details">
+                            <div class="profile-info">
+                                <div>
+                                    <label for="name">Name</label>
+                                    <input type="text" name="name" id="name" value="<?php echo htmlspecialchars($admin['name']); ?>" required aria-describedby="nameError">
+                                    <div class="inline-error" id="nameError"></div>
+                                </div>
+                                <div>
+                                    <label for="email">Email</label>
+                                    <input type="email" name="email" id="email" value="<?php echo htmlspecialchars($admin['email']); ?>" required aria-describedby="emailError">
+                                    <div class="inline-error" id="emailError"></div>
+                                </div>
+                                <div>
+                                    <label for="phone">Phone Number</label>
+                                    <input type="text" name="phone" id="phone" value="<?php echo htmlspecialchars($admin['phone']); ?>" required aria-describedby="phoneError">
+                                    <div class="inline-error" id="phoneError"></div>
+                                </div>
+                                <div>
+                                    <label for="address">Address</label>
+                                    <input type="text" name="address" id="address" value="<?php echo htmlspecialchars($admin['address']); ?>" required aria-describedby="addressError">
+                                    <div class="inline-error" id="addressError"></div>
+                                </div>
+                                <button type="submit" name="update_profile" class="action-btn" onclick="return confirm('Are you sure you want to save these changes?')" aria-label="Save Profile Changes">Save Changes</button>
+                            </div>
+                        </div>
                     </div>
                 </form>
             </div>
-        </div>
+        </section>
     </div>
 
     <!-- Add Car Modal -->
@@ -1082,138 +1135,139 @@ if ($report_type) {
                 <form id="editCarForm" method="POST" enctype="multipart/form-data">
                     <input type="hidden" name="csrf_token" value="<?php echo generate_csrf_token(); ?>">
                     <input type="hidden" name="car_id" id="editCarId">
-                    <input type="text" name="name" id="editCarName" placeholder="Car Name" required aria-describedby="editCarNameError">
-                    <div class="inline-error" id="editCarNameError"></div>
-                    <input type="text" name="model" id="editCarModel" placeholder="Car Model" required aria-describedby="editCarModelError">
-                    <div class="inline-error" id="editCarModelError"></div>
-                    <input type="text" name="license_plate" id="editCarLicensePlate" placeholder="License Plate" required aria-describedby="editCarLicensePlateError">
-                    <div class="inline-error" id="editCarLicensePlateError"></div>
-                    <input type="number" name="capacity" id="editCarCapacity" placeholder="Capacity" required min="1" max="10" aria-describedby="editCarCapacityError">
-                    <div class="inline-error" id="editCarCapacityError"></div>
-                    <select name="fuel_type" id="editCarFuelType" required aria-describedby="editCarFuelTypeError">
-                        <option value="" disabled>Select Fuel Type</option>
-                        <option value="Petrol">Petrol</option>
-                        <option value="Diesel">Diesel</option>
-                        <option value="Hybrid">Hybrid</option>
-                        <option value="Electric">Electric</option>
-                    </select>
-                    <div class="inline-error" id="editCarFuelTypeError"></div>
-                    <input type="number" name="price_per_day" id="editCarPricePerDay" placeholder="Price per Day (MWK)" step="0.01" required min="0" aria-describedby="editCarPricePerDayError">
-                    <div class="inline-error" id="editCarPricePerDayError"></div>
-                    <label><input type="checkbox" name="featured" id="editCarFeatured"> Featured Car</label>
-                    <input type="file" name="image" id="editCarImage" accept="image/jpeg,image/png,image/gif,image/bmp,image/webp" aria-describedby="editCarImageError">
-                    <div class="inline-error" id="editCarImageError"></div>
-                    <div class="modal-footer">
-                        <button type="button" class="action-btn" onclick="closeModal('editCarModal')" aria-label="Cancel">Cancel</button>
-                        <button type="submit" name="update_car" class="action-btn approve" onclick="return confirm('Are you sure you want to update this car?')" aria-label="Update Car">Update Car</button>
+                    <input type="text" name="name" id="editCarName" placeholder="Car Name"required aria-describedby="editCarNameError">
+
+<div class="inline-error" id="editCarNameError">
+</div> <input type="text" name="model" id="editCarModel" placeholder="Car Model" required aria-describedby="editCarModelError">
+ <div class="inline-error" id="editCarModelError"></div> 
+ <input type="text" name="license_plate" id="editCarLicensePlate" placeholder="License Plate" required aria-describedby="editCarLicensePlateError">
+  <div class="inline-error" id="editCarLicensePlateError">
+  </div> 
+  <input type="number" name="capacity" id="editCarCapacity" placeholder="Capacity" required min="1" max="10" aria-describedby="editCarCapacityError"> 
+  <div class="inline-error" id="editCarCapacityError"> </div> 
+  <select name="fuel_type" id="editCarFuelType" required aria-describedby="editCarFuelTypeError"> 
+  <option value="" disabled>Select Fuel Type</option> 
+  <option value="Petrol">Petrol</option> 
+  <option value="Diesel">Diesel</option> 
+  <option value="Hybrid">Hybrid</option> 
+  <option value="Electric">Electric</option> 
+  </select> <div class="inline-error" id="editCarFuelTypeError">
+  </div>
+   <input type="number" name="price_per_day" id="editCarPricePerDay" placeholder="Price per Day (MWK)" step="0.01" required min="0" aria-describedby="editCarPricePerDayError"> 
+   <div class="inline-error" id="editCarPricePerDayError">
+   </div> 
+   <label>
+   <input type="checkbox" name="featured" id="editCarFeatured"> Featured Car</label> 
+   <input type="file" name="image" id="editCarImage" accept="image/jpeg,image/png,image/gif,image/bmp,image/webp" aria-describedby="editCarImageError">
+    <div class="inline-error" id="editCarImageError"></div> <div class="modal-footer"> 
+    <button type="button" class="action-btn" onclick="closeModal('editCarModal')" aria-label="Cancel">Cancel</button> 
+    <button type="submit" name="update_car" class="action-btn approve" onclick="return confirm('Are you sure you want to update this car?')" aria-label="Update Car">Update Car</button> 
+    </div> </form> 
+</div> 
+</div> 
+</div> 
+<!-- Edit User Modal --> 
+ <div class="modal" id="editUserModal" aria-hidden="true"> 
+    
+    <div class="modal-content">
+     <div class="modal-header">
+         <h3>Edit User</h3>
+          <span class="close" aria-label="Close Edit User Modal">×</span> 
+        </div> <div class="modal-body"> <form id="editUserForm" method="POST"> 
+            <input type="hidden" name="csrf_token" value="<?php echo generate_csrf_token(); ?>">
+             <input type="hidden" name="user_id" id="editUserId">
+              <input type="text" name="first_name" id="editUserFirstName" placeholder="First Name" required aria-describedby="editUserFirstNameError"> 
+              <div class="inline-error" id="editUserFirstNameError">
+
+              </div> 
+              <input type="text" name="last_name" id="editUserLastName" placeholder="Last Name" required aria-describedby="editUserLastNameError">
+               <div class="inline-error" id="editUserLastNameError">
+
+               </div> <input type="text" name="occupation" id="editUserOccupation" placeholder="Occupation" aria-describedby="editUserOccupationError">
+                <div class="inline-error" id="editUserOccupationError">
+
+                </div>
+                 <input type="text" name="username" id="editUserUsername" placeholder="Username" required aria-describedby="editUserUsernameError"> 
+                 <div class="inline-error" id="editUserUsernameError">
+
+                 </div> <input type="email" name="email" id="editUserEmail" placeholder="Email" required aria-describedby="editUserEmailError">
+                  <div class="inline-error" id="editUserEmailError">
+
+                  </div>
+                   <input type="text" name="phone" id="editUserPhone" placeholder="Phone Number" required aria-describedby="editUserPhoneError">
+                    <div class="inline-error" id="editUserPhoneError">
+
+                    </div> <select name="gender" id="editUserGender" required aria-describedby="editUserGenderError">
+                         <option value="" disabled>Select Gender</option> <option value="Male">Male</option> 
+                         <option value="Female">Female</option> <option value="Other">Other</option>
+                         </select> <div class="inline-error" id="editUserGenderError">
+
+                         </div> <input type="number" name="age" id="editUserAge" placeholder="Age" required min="18" aria-describedby="editUserAgeError">
+                          <div class="inline-error" id="editUserAgeError">
+
+                          </div>
+                           <input type="text" name="address" id="editUserAddress" placeholder="Address" required aria-describedby="editUserAddressError">
+                            <div class="inline-error" id="editUserAddressError">
+
+                            </div> 
+                            <input type="text" name="location" id="editUserLocation" placeholder="Location" required aria-describedby="editUserLocationError"> 
+                            <div class="inline-error" id="editUserLocationError">
+
+                            </div> <input type="text" name="kin_name" id="editUserKinName" placeholder="Next of Kin Name" aria-describedby="editUserKinNameError">
+                             <div class="inline-error" id="editUserKinNameError">
+
+                             </div> 
+                             <input type="text" name="kin_relationship" id="editUserKinRelationship" placeholder="Kin Relationship" aria-describedby="editUserKinRelationshipError">
+                              <div class="inline-error" id="editUserKinRelationshipError">
+
+                              </div> 
+                              <input type="text" name="kin_phone" id="editUserKinPhone" placeholder="Kin Phone Number" aria-describedby="editUserKinPhoneError"> 
+                              <div class="inline-error" id="editUserKinPhoneError">
+
+                              </div>
+                               <select name="status" id="editUserStatus" required aria-describedby="editUserStatusError">
+                                 <option value="pending">Pending</option> <option value="approved">Approved</option> 
+                                 <option value="declined">Declined</option>
+                                 </select> <div class="inline-error" id="editUserStatusError">
+
+                                 </div> <div class="modal-footer"> 
+                                    <button type="button" class="action-btn" onclick="closeModal('editUserModal')" aria-label="Cancel">Cancel</button> 
+                                    <button type="submit" name="update_user" class="action-btn approve" onclick="return confirm('Are you sure you want to update this user?')" aria-label="Update User">Update User</button> 
+                                </div> 
+                            </form> 
+                        </div>
+                     </div> 
                     </div>
-                </form>
-            </div>
-        </div>
-    </div>
+                     <!-- Rejection Modal --> 
+                      <div class="modal" id="rejectionModal" aria-hidden="true">
+                         <div class="modal-content"> <div class="modal-header">
+                             <h3>Decline User</h3> 
+                             <span class="close" aria-label="Close Rejection Modal">×</span>
+                             </div> <div class="modal-body"> <form id="rejectionForm" method="POST">
+                                 <input type="hidden" name="csrf_token" value="<?php echo generate_csrf_token(); ?>">
+                                  <input type="hidden" name="user_id" id="rejectionUserId">
+                                   <input type="hidden" name="action" value="declined"> 
+                                   <textarea name="rejection_reason" id="rejectionReason" placeholder="Reason for rejection" required aria-describedby="rejectionReasonError">
 
-    <!-- Edit User Modal -->
-    <div class="modal" id="editUserModal" aria-hidden="true">
-        <div class="modal-content">
-            <div class="modal-header">
-                <h3>Edit User</h3>
-                <span class="close" aria-label="Close Edit User Modal">×</span>
-            </div>
-            <div class="modal-body">
-                <form id="editUserForm" method="POST">
-                    <input type="hidden" name="csrf_token" value="<?php echo generate_csrf_token(); ?>">
-                    <input type="hidden" name="user_id" id="editUserId">
-                    <input type="text" name="username" id="editUserUsername" placeholder="Username" required aria-describedby="editUserUsernameError">
-                    <div class="inline-error" id="editUserUsernameError"></div>
-                    <input type="email" name="email" id="editUserEmail" placeholder="Email" required aria-describedby="editUserEmailError">
-                    <div class="inline-error" id="editUserEmailError"></div>
-                    <input type="text" name="phone" id="editUserPhone" placeholder="Phone Number" required aria-describedby="editUserPhoneError">
-                    <div class="inline-error" id="editUserPhoneError"></div>
-                    <select name="gender" id="editUserGender" required aria-describedby="editUserGenderError">
-                        <option value="" disabled>Select Gender</option>
-                        <option value="Male">Male</option>
-                        <option value="Female">Female</option>
-                        <option value="Other">Other</option>
-                    </select>
-                    <div class="inline-error" id="editUserGenderError"></div>
-                    <input type="number" name="age" id="editUserAge" placeholder="Age" required min="18" aria-describedby="editUserAgeError">
-                    <div class="inline-error" id="editUserAgeError"></div>
-                    <input type="text" name="address" id="editUserAddress" placeholder="Address" required aria-describedby="editUserAddressError">
-                    <div class="inline-error" id="editUserAddressError"></div>
-                    <input type="text" name="location" id="editUserLocation" placeholder="Location" required aria-describedby="editUserLocationError">
-                    <div class="inline-error" id="editUserLocationError"></div>
-                    <input type="text" name="kin_name" id="editUserKinName" placeholder="Next of Kin Name" aria-describedby="editUserKinNameError">
-                    <div class="inline-error" id="editUserKinNameError"></div>
-                    <input type="text" name="kin_relationship" id="editUserKinRelationship" placeholder="Kin Relationship" aria-describedby="editUserKinRelationshipError">
-                    <div class="inline-error" id="editUserKinRelationshipError"></div>
-                    <input type="text" name="kin_phone" id="editUserKinPhone" placeholder="Kin Phone" aria-describedby="editUserKinPhoneError">
-                    <div class="inline-error" id="editUserKinPhoneError"></div>
-                    <select name="status" id="editUserStatus" required aria-describedby="editUserStatusError">
-                        <option value="" disabled>Select Status</option>
-                        <option value="pending">Pending</option>
-                        <option value="approved">Approved</option>
-                        <option value="declined">Declined</option>
-                    </select>
-                    <div class="inline-error" id="editUserStatusError"></div>
-                    <div class="modal-footer">
-                        <button type="button" class="action-btn" onclick="closeModal('editUserModal')" aria-label="Cancel">Cancel</button>
-                        <button type="submit" name="update_user" class="action-btn approve" onclick="return confirm('Are you sure you want to update this user?')" aria-label="Update User">Update User</button>
-                    </div>
-                </form>
-            </div>
-        </div>
-    </div>
+                                   </textarea>
+                                    <div class="inline-error" id="rejectionReasonError">
 
-    <!-- Rejection Reason Modal -->
-    <div class="modal" id="rejectionModal" aria-hidden="true">
-        <div class="modal-content">
-            <div class="modal-header">
-                <h3>Decline User</h3>
-                <span class="close" aria-label="Close Rejection Modal">×</span>
-            </div>
-            <div class="modal-body">
-                <form id="rejectionForm" method="POST">
-                    <input type="hidden" name="csrf_token" value="<?php echo generate_csrf_token(); ?>">
-                    <input type="hidden" name="user_id" id="rejectUserId">
-                    <input type="hidden" name="user_action" value="declined">
-                    <textarea name="rejection_reason" id="rejectionReason" placeholder="Enter reason for declining the user" required aria-describedby="rejectionReasonError"></textarea>
-                    <div class="inline-error" id="rejectionReasonError"></div>
-                    <div class="modal-footer">
-                        <button type="button" class="action-btn" onclick="closeModal('rejectionModal')" aria-label="Cancel">Cancel</button>
-                        <button type="submit" class="action-btn decline" aria-label="Submit Rejection">Decline User</button>
-                    </div>
-                </form>
-            </div>
-        </div>
-    </div>
+                                    </div>
+                                     <div class="modal-footer">
+                                        
+                                     <button type="button" class="action-btn" onclick="closeModal('rejectionModal')" aria-label="Cancel">Cancel</button>
+                                      <button type="submit" name="user_action" class="action-btn decline" onclick="return confirm('Are you sure you want to decline this user?')" aria-label="Decline User">Decline</button> 
+                                    </div>
+                                 </form> 
+                                 </div>
+                                 </div>
+                                 </div>
+                                 
 
-    <footer class="footer">
-        <p>© 2025 Mibesa CarRental. All rights reserved.</p>
-    </footer>
 
-    <script>
-        document.addEventListener('DOMContentLoaded', () => {
-            // Initialize page
-            const urlParams = new URLSearchParams(window.location.search);
-            const section = urlParams.get('section') || 'dashboard';
-            showSection(section);
 
-            // Auto-hide messages
-            document.querySelectorAll('.alert, .success').forEach(msg => {
-                msg.style.display = 'block';
-                setTimeout(() => msg.style.display = 'none', 5000);
-            });
-
-            // Show login modal if not logged in
-            const isAdminLoggedIn = <?php echo isset($_SESSION['admin_id']) ? 'true' : 'false'; ?>;
-            if (!isAdminLoggedIn) {
-                openModal('adminLoginModal');
-                lockLoginModal();
-            }
-        });
-
-// Toggle Sidebar
-function toggleSidebar() {
+                                     <script>
+                                     function toggleSidebar() {
     const sidebar = document.getElementById('sidebar');
     const content = document.getElementById('content');
     const topbar = document.getElementById('topbar');
@@ -1222,39 +1276,74 @@ function toggleSidebar() {
     topbar.classList.toggle('collapsed');
 }
 
-// Show Section
 function showSection(sectionId) {
     document.querySelectorAll('.section').forEach(section => {
         section.classList.remove('active');
     });
     document.getElementById(sectionId).classList.add('active');
-
-    // Update URL
-    const url = new URL(window.location);
-    url.searchParams.set('section', sectionId);
-    history.pushState({}, '', url);
+    window.history.pushState({}, '', `admin_dashboard.php?section=${sectionId}`);
 }
 
-// Modal Functions
 function openModal(modalId) {
     document.getElementById(modalId).style.display = 'flex';
-    document.getElementById(modalId).setAttribute('aria-hidden', 'false');
 }
 
 function closeModal(modalId) {
     document.getElementById(modalId).style.display = 'none';
-    document.getElementById(modalId).setAttribute('aria-hidden', 'true');
+    // Reset forms and errors
+    const modal = document.getElementById(modalId);
+    const form = modal.querySelector('form');
+    if (form) form.reset();
+    modal.querySelectorAll('.inline-error').forEach(error => {
+        error.style.display = 'none';
+        error.textContent = '';
+    });
 }
 
-function lockLoginModal() {
-    const loginModal = document.getElementById('adminLoginModal');
-    const closeButton = loginModal.querySelector('.close');
-    closeButton.style.pointerEvents = 'none';
-    closeButton.style.opacity = '0.5';
-    closeButton.setAttribute('aria-disabled', 'true');
+function openEditCarModal(car) {
+    document.getElementById('editCarId').value = car.id;
+    document.getElementById('editCarName').value = car.name;
+    document.getElementById('editCarModel').value = car.model;
+    document.getElementById('editCarLicensePlate').value = car.license_plate;
+    document.getElementById('editCarCapacity').value = car.capacity;
+    document.getElementById('editCarFuelType').value = car.fuel_type;
+    document.getElementById('editCarPricePerDay').value = car.price_per_day;
+    document.getElementById('editCarFeatured').checked = car.featured == 1;
+    document.getElementById('editCarImage').value = ''; // Clear file input
+    openModal('editCarModal');
 }
 
-// Search and Filter Functions
+function openEditUserModal(user) {
+    document.getElementById('editUserId').value = user.id;
+    document.getElementById('editUserFirstName').value = user.first_name || '';
+    document.getElementById('editUserLastName').value = user.last_name || '';
+    document.getElementById('editUserOccupation').value = user.occupation || '';
+    document.getElementById('editUserUsername').value = user.username || '';
+    document.getElementById('editUserEmail').value = user.email;
+    document.getElementById('editUserPhone').value = user.phone;
+    document.getElementById('editUserGender').value = user.gender;
+    document.getElementById('editUserAge').value = user.age;
+    document.getElementById('editUserAddress').value = user.address;
+    document.getElementById('editUserLocation').value = user.location;
+    document.getElementById('editUserKinName').value = user.kin_name || '';
+    document.getElementById('editUserKinRelationship').value = user.kin_relationship || '';
+    document.getElementById('editUserKinPhone').value = user.kin_phone || '';
+    document.getElementById('editUserStatus').value = user.status;
+    openModal('editUserModal');
+}
+
+function openRejectionModal(userId) {
+    document.getElementById('rejectionUserId').value = userId;
+    openModal('rejectionModal');
+}
+
+function downloadNationalId(dataUrl, filename) {
+    const link = document.createElement('a');
+    link.href = dataUrl;
+    link.download = `${filename}_national_id.pdf`;
+    link.click();
+}
+
 function applyUserSearchFilter() {
     const search = document.getElementById('userSearch').value;
     const filter = document.getElementById('userFilter').value;
@@ -1273,149 +1362,319 @@ function applyBookingSearchFilter() {
     window.location.href = `admin_dashboard.php?section=manage-bookings&search=${encodeURIComponent(search)}&filter=${filter}`;
 }
 
-// Edit Car Modal
-function openEditCarModal(car) {
-    document.getElementById('editCarId').value = car.id;
-    document.getElementById('editCarName').value = car.name;
-    document.getElementById('editCarModel').value = car.model;
-    document.getElementById('editCarLicensePlate').value = car.license_plate;
-    document.getElementById('editCarCapacity').value = car.capacity;
-    document.getElementById('editCarFuelType').value = car.fuel_type;
-    document.getElementById('editCarPricePerDay').value = car.price_per_day;
-    document.getElementById('editCarFeatured').checked = car.featured == 1;
-    openModal('editCarModal');
-}
-
-// Edit User Modal
-function openEditUserModal(user) {
-    document.getElementById('editUserId').value = user.id;
-    document.getElementById('editUserUsername').value = user.username;
-    document.getElementById('editUserEmail').value = user.email;
-    document.getElementById('editUserPhone').value = user.phone;
-    document.getElementById('editUserGender').value = user.gender;
-    document.getElementById('editUserAge').value = user.age;
-    document.getElementById('editUserAddress').value = user.address;
-    document.getElementById('editUserLocation').value = user.location;
-    document.getElementById('editUserKinName').value = user.kin_name || '';
-    document.getElementById('editUserKinRelationship').value = user.kin_relationship || '';
-    document.getElementById('editUserKinPhone').value = user.kin_phone || '';
-    document.getElementById('editUserStatus').value = user.status;
-    openModal('editUserModal');
-}
-
-// Rejection Modal
-function openRejectionModal(userId) {
-    document.getElementById('rejectUserId').value = userId;
-    openModal('rejectionModal');
-}
-
-// Download National ID
-function downloadNationalId(base64Data, filename) {
-    const link = document.createElement('a');
-    link.href = base64Data;
-    link.download = `${filename}_national_id.pdf`;
-    document.body.appendChild(link);
-    link.click();
-    document.body.removeChild(link);
-}
-
-// Save Profile
-function saveProfile() {
-    const phone = document.getElementById('phone').value;
-    const address = document.getElementById('address').value;
-    const phoneError = document.getElementById('phoneError');
-    const addressError = document.getElementById('addressError');
-
-    let valid = true;
-    phoneError.style.display = 'none';
-    addressError.style.display = 'none';
-
-    if (!phone.match(/^0[0-9]{9}$/)) {
-        phoneError.textContent = 'Phone number must be 10 digits starting with 0.';
-        phoneError.style.display = 'block';
-        valid = false;
-    }
-    if (!address.trim()) {
-        addressError.textContent = 'Address is required.';
-        addressError.style.display = 'block';
-        valid = false;
-    }
-
-    if (valid) {
-        // Simulate AJAX call to save profile
-        alert('Profile saved successfully!');
-    }
-}
-
-// Admin Login
-document.getElementById('loginForm').addEventListener('submit', async (e) => {
-    e.preventDefault();
-    const email = document.getElementById('adminEmail').value;
-    const password = document.getElementById('adminPassword').value;
-    const emailError = document.getElementById('adminEmailError');
-    const passwordError = document.getElementById('adminPasswordError');
-
-    emailError.style.display = 'none';
-    passwordError.style.display = 'none';
-
-    try {
-        const response = await fetch('admin_login.php', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ email, password })
-        });
-        const result = await response.json();
-
-        if (result.success) {
-            closeModal('adminLoginModal');
-            window.location.reload();
-        } else {
-            if (result.error.includes('email')) {
-                emailError.textContent = result.error;
-                emailError.style.display = 'block';
-            } else {
-                passwordError.textContent = result.error;
-                passwordError.style.display = 'block';
-            }
-        }
-    } catch (error) {
-        passwordError.textContent = 'An error occurred. Please try again.';
-        passwordError.style.display = 'block';
-    }
-});
-
-// Logout
-async function logout() {
+function logout() {
     if (confirm('Are you sure you want to logout?')) {
-        try {
-            const response = await fetch('admin_logout.php', { method: 'POST' });
-            const result = await response.json();
-            if (result.success) {
-                window.location.href = 'admin_dashboard.php';
-            }
-        } catch (error) {
-            alert('Error during logout. Please try again.');
-        }
+        window.location.href = 'admin_logout.php';
     }
 }
 
-// Close Modal on Outside Click (except login modal when not logged in)
-window.addEventListener('click', (e) => {
-    const modals = document.querySelectorAll('.modal');
-    modals.forEach(modal => {
-        if (e.target === modal && modal.id !== 'adminLoginModal') {
-            closeModal(modal.id);
-        }
-    });
+// Profile image preview
+document.getElementById('profileImageUpload').addEventListener('change', function(event) {
+    const file = event.target.files[0];
+    if (file) {
+        const reader = new FileReader();
+        reader.onload = function(e) {
+            document.getElementById('profileImagePreview').src = e.target.result;
+        };
+        reader.readAsDataURL(file);
+    }
 });
 
-// Close Modal with Close Button
+// Client-side validation for profile form
+document.getElementById('profileForm').addEventListener('submit', function(event) {
+    let valid = true;
+    const name = document.getElementById('name').value.trim();
+    const email = document.getElementById('email').value.trim();
+    const phone = document.getElementById('phone').value.trim();
+    const address = document.getElementById('address').value.trim();
+    const image = document.getElementById('profileImageUpload').files[0];
+
+    // Reset errors
+    document.querySelectorAll('.inline-error').forEach(error => {
+        error.style.display = 'none';
+        error.textContent = '';
+    });
+
+    if (!name) {
+        valid = false;
+        document.getElementById('nameError').textContent = 'Name is required.';
+        document.getElementById('nameError').style.display = 'block';
+    }
+    if (!email || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+        valid = false;
+        document.getElementById('emailError').textContent = 'A valid email is required.';
+        document.getElementById('emailError').style.display = 'block';
+    }
+    if (!phone || !/^0[0-9]{9}$/.test(phone)) {
+        valid = false;
+        document.getElementById('phoneError').textContent = 'Phone number must be 10 digits starting with 0.';
+        document.getElementById('phoneError').style.display = 'block';
+    }
+    if (!address) {
+        valid = false;
+        document.getElementById('addressError').textContent = 'Address is required.';
+        document.getElementById('addressError').style.display = 'block';
+    }
+    if (image) {
+        const maxSize = 2 * 1024 * 1024;
+        const allowedTypes = ['image/jpeg', 'image/png', 'image/gif', 'image/bmp', 'image/webp'];
+        if (!allowedTypes.includes(image.type)) {
+            valid = false;
+            document.getElementById('profileImageError').textContent = 'Invalid image type.';
+            document.getElementById('profileImageError').style.display = 'block';
+        } else if (image.size > maxSize) {
+            valid = false;
+            document.getElementById('profileImageError').textContent = 'Image size exceeds 2MB.';
+            document.getElementById('profileImageError').style.display = 'block';
+        }
+    }
+
+    if (!valid) {
+        event.preventDefault();
+    }
+});
+
+// Client-side validation for add car form
+document.getElementById('addCarForm').addEventListener('submit', function(event) {
+    let valid = true;
+    const name = document.getElementById('addCarName').value.trim();
+    const model = document.getElementById('addCarModel').value.trim();
+    const licensePlate = document.getElementById('addCarLicensePlate').value.trim();
+    const capacity = document.getElementById('addCarCapacity').value;
+    const fuelType = document.getElementById('addCarFuelType').value;
+    const pricePerDay = document.getElementById('addCarPricePerDay').value;
+    const image = document.getElementById('addCarImage').files[0];
+
+    // Reset errors
+    document.querySelectorAll('.inline-error').forEach(error => {
+        error.style.display = 'none';
+        error.textContent = '';
+    });
+
+    if (!name) {
+        valid = false;
+        document.getElementById('addCarNameError').textContent = 'Car name is required.';
+        document.getElementById('addCarNameError').style.display = 'block';
+    }
+    if (!model) {
+        valid = false;
+        document.getElementById('addCarModelError').textContent = 'Car model is required.';
+        document.getElementById('addCarModelError').style.display = 'block';
+    }
+    if (!licensePlate) {
+        valid = false;
+        document.getElementById('addCarLicensePlateError').textContent = 'License plate is required.';
+        document.getElementById('addCarLicensePlateError').style.display = 'block';
+    }
+    if (!capacity || capacity < 1 || capacity > 10) {
+        valid = false;
+        document.getElementById('addCarCapacityError').textContent = 'Capacity must be between 1 and 10.';
+        document.getElementById('addCarCapacityError').style.display = 'block';
+    }
+    if (!fuelType) {
+        valid = false;
+        document.getElementById('addCarFuelTypeError').textContent = 'Fuel type is required.';
+        document.getElementById('addCarFuelTypeError').style.display = 'block';
+    }
+    if (!pricePerDay || pricePerDay <= 0) {
+        valid = false;
+        document.getElementById('addCarPricePerDayError').textContent = 'Price per day must be greater than 0.';
+        document.getElementById('addCarPricePerDayError').style.display = 'block';
+    }
+    if (image) {
+        const maxSize = 5 * 1024 * 1024;
+        const allowedTypes = ['image/jpeg', 'image/png', 'image/gif', 'image/bmp', 'image/webp'];
+        if (!allowedTypes.includes(image.type)) {
+            valid = false;
+            document.getElementById('addCarImageError').textContent = 'Invalid image type.';
+            document.getElementById('addCarImageError').style.display = 'block';
+        } else if (image.size > maxSize) {
+            valid = false;
+            document.getElementById('addCarImageError').textContent = 'Image size exceeds 5MB.';
+            document.getElementById('addCarImageError').style.display = 'block';
+        }
+    }
+
+    if (!valid) {
+        event.preventDefault();
+    }
+});
+
+// Client-side validation for edit car form
+document.getElementById('editCarForm').addEventListener('submit', function(event) {
+    let valid = true;
+    const name = document.getElementById('editCarName').value.trim();
+    const model = document.getElementById('editCarModel').value.trim();
+    const licensePlate = document.getElementById('editCarLicensePlate').value.trim();
+    const capacity = document.getElementById('editCarCapacity').value;
+    const fuelType = document.getElementById('editCarFuelType').value;
+    const pricePerDay = document.getElementById('editCarPricePerDay').value;
+    const image = document.getElementById('editCarImage').files[0];
+
+    // Reset errors
+    document.querySelectorAll('.inline-error').forEach(error => {
+        error.style.display = 'none';
+        error.textContent = '';
+    });
+
+    if (!name) {
+        valid = false;
+        document.getElementById('editCarNameError').textContent = 'Car name is required.';
+        document.getElementById('editCarNameError').style.display = 'block';
+    }
+    if (!model) {
+        valid = false;
+        document.getElementById('editCarModelError').textContent = 'Car model is required.';
+        document.getElementById('editCarModelError').style.display = 'block';
+    }
+    if (!licensePlate) {
+        valid = false;
+        document.getElementById('editCarLicensePlateError').textContent = 'License plate is required.';
+        document.getElementById('editCarLicensePlateError').style.display = 'block';
+    }
+    if (!capacity || capacity < 1 || capacity > 10) {
+        valid = false;
+        document.getElementById('editCarCapacityError').textContent = 'Capacity must be between 1 and 10.';
+        document.getElementById('editCarCapacityError').style.display = 'block';
+    }
+    if (!fuelType) {
+        valid = false;
+        document.getElementById('editCarFuelTypeError').textContent = 'Fuel type is required.';
+        document.getElementById('editCarFuelTypeError').style.display = 'block';
+    }
+    if (!pricePerDay || pricePerDay <= 0) {
+        valid = false;
+        document.getElementById('editCarPricePerDayError').textContent = 'Price per day must be greater than 0.';
+        document.getElementById('editCarPricePerDayError').style.display = 'block';
+    }
+    if (image) {
+        const maxSize = 5 * 1024 * 1024;
+        const allowedTypes = ['image/jpeg', 'image/png', 'image/gif', 'image/bmp', 'image/webp'];
+        if (!allowedTypes.includes(image.type)) {
+            valid = false;
+            document.getElementById('editCarImageError').textContent = 'Invalid image type.';
+            document.getElementById('editCarImageError').style.display = 'block';
+        } else if (image.size > maxSize) {
+            valid = false;
+            document.getElementById('editCarImageError').textContent = 'Image size exceeds 5MB.';
+            document.getElementById('editCarImageError').style.display = 'block';
+        }
+    }
+
+    if (!valid) {
+        event.preventDefault();
+    }
+});
+
+// Client-side validation for edit user form
+document.getElementById('editUserForm').addEventListener('submit', function(event) {
+    let valid = true;
+    const firstName = document.getElementById('editUserFirstName').value.trim();
+    const lastName = document.getElementById('editUserLastName').value.trim();
+    const username = document.getElementById('editUserUsername').value.trim();
+    const email = document.getElementById('editUserEmail').value.trim();
+    const phone = document.getElementById('editUserPhone').value.trim();
+    const gender = document.getElementById('editUserGender').value;
+    const age = document.getElementById('editUserAge').value;
+    const address = document.getElementById('editUserAddress').value.trim();
+    const location = document.getElementById('editUserLocation').value.trim();
+    const status = document.getElementById('editUserStatus').value;
+
+    // Reset errors
+    document.querySelectorAll('.inline-error').forEach(error => {
+        error.style.display = 'none';
+        error.textContent = '';
+    });
+
+    if (!firstName) {
+        valid = false;
+        document.getElementById('editUserFirstNameError').textContent = 'First name is required.';
+        document.getElementById('editUserFirstNameError').style.display = 'block';
+    }
+    if (!lastName) {
+        valid = false;
+        document.getElementById('editUserLastNameError').textContent = 'Last name is required.';
+        document.getElementById('editUserLastNameError').style.display = 'block';
+    }
+    if (!username) {
+        valid = false;
+        document.getElementById('editUserUsernameError').textContent = 'Username is required.';
+        document.getElementById('editUserUsernameError').style.display = 'block';
+    }
+    if (!email || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+        valid = false;
+        document.getElementById('editUserEmailError').textContent = 'A valid email is required.';
+        document.getElementById('editUserEmailError').style.display = 'block';
+    }
+    if (!phone || !/^0[0-9]{9}$/.test(phone)) {
+        valid = false;
+        document.getElementById('editUserPhoneError').textContent = 'Phone number must be 10 digits starting with 0.';
+        document.getElementById('editUserPhoneError').style.display = 'block';
+    }
+    if (!gender) {
+        valid = false;
+        document.getElementById('editUserGenderError').textContent = 'Gender is required.';
+        document.getElementById('editUserGenderError').style.display = 'block';
+    }
+    if (!age || age < 18) {
+        valid = false;
+        document.getElementById('editUserAgeError').textContent = 'Age must be 18 or older.';
+        document.getElementById('editUserAgeError').style.display = 'block';
+    }
+    if (!address) {
+        valid = false;
+        document.getElementById('editUserAddressError').textContent = 'Address is required.';
+        document.getElementById('editUserAddressError').style.display = 'block';
+    }
+    if (!location) {
+        valid = false;
+        document.getElementById('editUserLocationError').textContent = 'Location is required.';
+        document.getElementById('editUserLocationError').style.display = 'block';
+    }
+    if (!status) {
+        valid = false;
+        document.getElementById('editUserStatusError').textContent = 'Status is required.';
+        document.getElementById('editUserStatusError').style.display = 'block';
+    }
+
+    if (!valid) {
+        event.preventDefault();
+    }
+});
+
+// Client-side validation for rejection form
+document.getElementById('rejectionForm').addEventListener('submit', function(event) {
+    let valid = true;
+    const reason = document.getElementById('rejectionReason').value.trim();
+
+    // Reset errors
+    document.querySelectorAll('.inline-error').forEach(error => {
+        error.style.display = 'none';
+        error.textContent = '';
+    });
+
+    if (!reason) {
+        valid = false;
+        document.getElementById('rejectionReasonError').textContent = 'Rejection reason is required.';
+        document.getElementById('rejectionReasonError').style.display = 'block';
+    }
+
+    if (!valid) {
+        event.preventDefault();
+    }
+});
+
+// Close modals when clicking outside
+window.addEventListener('click', function(event) {
+    if (event.target.classList.contains('modal')) {
+        closeModal(event.target.id);
+    }
+});
+
+// Close modals with close button
 document.querySelectorAll('.close').forEach(closeBtn => {
     closeBtn.addEventListener('click', () => {
-        const modal = closeBtn.closest('.modal');
-        if (modal.id !== 'adminLoginModal' || closeBtn.style.pointerEvents !== 'none') {
-            closeModal(modal.id);
-        }
+        closeModal(closeBtn.closest('.modal').id);
     });
 });
 </script>

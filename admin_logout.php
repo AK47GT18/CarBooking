@@ -6,5 +6,5 @@ if (session_status() === PHP_SESSION_NONE) {
 
 $_SESSION = [];
 session_destroy();
-echo json_encode(['success' => true]);
+header("Location: admin_login.php");
 ?>

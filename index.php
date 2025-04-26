@@ -4,7 +4,7 @@ require 'config.php';
 use GuzzleHttp\Client;
 use GuzzleHttp\Exception\RequestException;
 
-// Ensure session is started
+// Start session
 if (session_status() === PHP_SESSION_NONE) {
     session_start();
 }
@@ -28,7 +28,7 @@ if (isset($_SESSION['user_id'])) {
     $user = $stmt->fetch();
     if ($user && ($user['status'] !== 'approved' || $user['payment_status'] !== 'paid')) {
         session_destroy();
-        header("Location: index.php?message=Account pending approval or payment");
+        header("Location: index.php?message=Your account is pending approval or payment");
         exit;
     }
 }
@@ -36,21 +36,38 @@ if (isset($_SESSION['user_id'])) {
 // Handle login
 if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_POST['login'])) {
     if (!validateCsrfToken($_POST['csrf_token'])) {
-        $error = "Invalid CSRF token";
+        $error = "Security error: Invalid CSRF token";
     } else {
         $email = filter_var($_POST['loginEmail'], FILTER_SANITIZE_EMAIL);
         $password = $_POST['loginPassword'];
 
-        $stmt = $pdo->prepare("SELECT * FROM users WHERE email = ?");
-        $stmt->execute([$email]);
-        $user = $stmt->fetch();
-
-        if ($user && password_verify($password, $user['password']) && $user['status'] == 'approved' && $user['payment_status'] == 'paid') {
-            $_SESSION['user_id'] = $user['id'];
-            header("Location: index.php");
-            exit;
+        if (!filter_var($email, FILTER_VALIDATE_EMAIL)) {
+            $error = "Please enter a valid email address";
+        } elseif (empty($password)) {
+            $error = "Password cannot be empty";
         } else {
-            $error = "Invalid credentials, account not approved, or payment pending";
+            try {
+                $stmt = $pdo->prepare("SELECT * FROM users WHERE email = ?");
+                $stmt->execute([$email]);
+                $user = $stmt->fetch();
+
+                if ($user && password_verify($password, $user['password'])) {
+                    if ($user['status'] !== 'approved') {
+                        $error = "Your account is still pending approval";
+                    } elseif ($user['payment_status'] !== 'paid') {
+                        $error = "Please complete your payment to proceed";
+                    } else {
+                        $_SESSION['user_id'] = $user['id'];
+                        header("Location: index.php?message=Successfully logged in");
+                        exit;
+                    }
+                } else {
+                    $error = "Incorrect email or password";
+                }
+            } catch (PDOException $e) {
+                error_log("Database error in login: " . $e->getMessage());
+                $error = "Something went wrong. Please try again later.";
+            }
         }
     }
 }
@@ -58,12 +75,15 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_POST['login'])) {
 // Handle signup
 if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_POST['signup'])) {
     if (!validateCsrfToken($_POST['csrf_token'])) {
-        $error = "Invalid CSRF token";
+        $error = "Security error: Invalid CSRF token";
     } else {
+        $first_name = filter_var($_POST['first_name'], FILTER_SANITIZE_STRING);
+        $last_name = filter_var($_POST['last_name'], FILTER_SANITIZE_STRING);
         $username = filter_var($_POST['username'], FILTER_SANITIZE_STRING);
         $email = filter_var($_POST['email'], FILTER_SANITIZE_EMAIL);
         $phone = $_POST['phone'];
-        $password = password_hash($_POST['password'], PASSWORD_BCRYPT);
+        $password = $_POST['password'];
+        $confirm_password = $_POST['confirm_password'];
         $gender = $_POST['gender'];
         $address = filter_var($_POST['address'], FILTER_SANITIZE_STRING);
         $location = $_POST['location'];
@@ -71,78 +91,150 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_POST['signup'])) {
         $kin_relationship = $_POST['kin_relationship'];
         $kin_phone = $_POST['kin_phone'];
         $age = filter_var($_POST['age'], FILTER_SANITIZE_NUMBER_INT);
+        $occupation = filter_var($_POST['occupation'], FILTER_SANITIZE_STRING);
         $profile_picture_file = $_FILES['profile_picture'];
         $national_id_file = $_FILES['national_id'];
 
-        // Validate inputs
-        if (!$username) {
-            $error = "Username is required.";
-        } elseif (!preg_match('/^0[0-9]{9}$/', $phone)) {
-            $error = "Invalid phone number format. Must be 10 digits starting with 0 (e.g., 0885620896).";
-        } elseif (!preg_match('/^0[0-9]{9}$/', $kin_phone)) {
-            $error = "Invalid next of kin phone number format. Must be 10 digits starting with 0 (e.g., 0885620896).";
-        } elseif (!isset($national_id_file) || $national_id_file['error'] !== UPLOAD_ERR_OK || $national_id_file['type'] !== 'application/pdf' || $national_id_file['size'] > 2 * 1024 * 1024) {
-            $error = "Invalid national ID file. Must be a PDF under 2MB.";
-        } elseif (!isset($profile_picture_file) || $profile_picture_file['error'] !== UPLOAD_ERR_OK || !in_array($profile_picture_file['type'], ['image/jpeg', 'image/png']) || $profile_picture_file['size'] > 2 * 1024 * 1024) {
-            $error = "Invalid profile picture file. Must be JPEG or PNG under 2MB.";
-        } elseif ($age < 18 || $age > 100) {
-            $error = "Age must be between 18 and 100.";
+        // Server-side validation
+        if (!preg_match('/^[A-Za-z]{2,50}$/', $first_name)) {
+            $error = "First name must be 2-50 letters only";
+        } elseif (!preg_match('/^[A-Za-z]{2,50}$/', $last_name)) {
+            $error = "Last name must be 2-50 letters only";
+        } elseif (!preg_match('/^[A-Za-z0-9_]{3,50}$/', $username)) {
+            $error = "Username must be 3-50 characters (letters, numbers, or underscores)";
+        } elseif (!filter_var($email, FILTER_VALIDATE_EMAIL)) {
+            $error = "Please enter a valid email address";
         } else {
-            // Create tmp directory if it doesn't exist
-            $tmp_dir = 'tmp';
-            if (!is_dir($tmp_dir)) {
-                mkdir($tmp_dir, 0755, true);
-            }
-
-            // Move uploaded files to tmp directory
-            $national_id_filename = 'national_id_' . time() . '.pdf';
-            $profile_picture_filename = 'profile_picture_' . time() . '.' . ($profile_picture_file['type'] === 'image/jpeg' ? 'jpg' : 'png');
-            $national_id_path = "$tmp_dir/$national_id_filename";
-            $profile_picture_path = "$tmp_dir/$profile_picture_filename";
-
-            if (!move_uploaded_file($national_id_file['tmp_name'], $national_id_path) || !move_uploaded_file($profile_picture_file['tmp_name'], $profile_picture_path)) {
-                $error = "Failed to process uploaded files.";
+            // Check if email already exists
+            $stmt = $pdo->prepare("SELECT COUNT(*) FROM users WHERE email = ?");
+            $stmt->execute([$email]);
+            if ($stmt->fetchColumn() > 0) {
+                $error = "This email is already registered. Please use a different email or log in.";
+            } elseif (!preg_match('/^0[0-9]{9}$/', $phone)) {
+                $error = "Phone number must be 10 digits starting with 0 (e.g., 0823456789)";
+            } elseif (!preg_match('/^(?=.*[a-z])(?=.*[A-Z])(?=.*\d)(?=.*[@$!%*?&])[A-Za-z\d@$!%*?&]{8,}$/', $password)) {
+                $error = "Password must be at least 8 characters, including uppercase, lowercase, number, and special character";
+            } elseif ($password !== $confirm_password) {
+                $error = "Passwords do not match";
+            } elseif (!in_array($gender, ['Male', 'Female', 'Other'])) {
+                $error = "Please select a valid gender";
+            } elseif (empty($address)) {
+                $error = "Address is required";
+            } elseif (!in_array($location, ['Lilongwe', 'Blantyre', 'Mzuzu', 'Zomba'])) {
+                $error = "Please select a valid location";
+            } elseif (empty($kin_name)) {
+                $error = "Next of kin name is required";
+            } elseif (!in_array($kin_relationship, ['Parent', 'Sibling', 'Spouse', 'Friend', 'Other'])) {
+                $error = "Please select a valid relationship";
+            } elseif (!preg_match('/^0[0-9]{9}$/', $kin_phone)) {
+                $error = "Next of kin phone must be 10 digits starting with 0 (e.g., 0885620896)";
+            } elseif ($age < 18 || $age > 100) {
+                $error = "Age must be between 18 and 100";
+            } elseif (empty($occupation)) {
+                $error = "Occupation is required";
+            } elseif (!isset($national_id_file) || $national_id_file['error'] !== UPLOAD_ERR_OK || $national_id_file['type'] !== 'application/pdf' || $national_id_file['size'] > 2 * 1024 * 1024) {
+                $error = "National ID must be a PDF file under 2MB";
+            } elseif (!isset($profile_picture_file) || $profile_picture_file['error'] !== UPLOAD_ERR_OK || !in_array($profile_picture_file['type'], ['image/jpeg', 'image/png']) || $profile_picture_file['size'] > 2 * 1024 * 1024) {
+                $error = "Profile picture must be a JPEG or PNG image under 2MB";
             } else {
-                // Store data temporarily in session
-                $_SESSION['temp_signup_data'] = [
-                    'username' => $username,
-                    'email' => $email,
-                    'phone' => $phone,
-                    'password' => $password,
-                    'gender' => $gender,
-                    'address' => $address,
-                    'location' => $location,
-                    'kin_name' => $kin_name,
-                    'kin_relationship' => $kin_relationship,
-                    'kin_phone' => $kin_phone,
-                    'national_id' => base64_encode(file_get_contents($national_id_path)),
-                    'profile_picture' => base64_encode(file_get_contents($profile_picture_path)),
-                    'age' => $age,
-                    'national_id_path' => $national_id_path,
-                    'profile_picture_path' => $profile_picture_path
-                ];
-
-                $payment = initiateUSSDPayment($pdo, 0, 50, 'signup', null, $_SESSION['temp_signup_data']);
-                if (isset($payment['error'])) {
-                    $payment_error = $payment['error'];
-                    $payment_type = $payment['type'];
-                    $temp_signup_data = $_SESSION['temp_signup_data'];
-                    // Clean up temporary files
-                    @unlink($national_id_path);
-                    @unlink($profile_picture_path);
-                    unset($_SESSION['temp_signup_data']);
-                } else {
-                    $user_id = $payment['user_id'];
-                    $adminStmt = $pdo->query("SELECT email FROM admins");
-                    while ($admin = $adminStmt->fetch()) {
-                        sendEmail($admin['email'], "New User Signup", "A new user ($username, $email) has signed up and completed payment (charge_id: {$payment['charge_id']}).");
-                    }
-                    // Clean up temporary files
-                    @unlink($national_id_path);
-                    @unlink($profile_picture_path);
-                    header("Location: index.php?message=" . urlencode($payment['message']));
-                    exit;
+                // Create tmp directory
+                $tmp_dir = 'tmp';
+                if (!is_dir($tmp_dir)) {
+                    mkdir($tmp_dir, 0755, true);
                 }
+
+                // Move uploaded files
+                $national_id_filename = 'national_id_' . time() . '.pdf';
+                $profile_picture_filename = 'profile_picture_' . time() . '.' . ($profile_picture_file['type'] === 'image/jpeg' ? 'jpg' : 'png');
+                $national_id_path = "$tmp_dir/$national_id_filename";
+                $profile_picture_path = "$tmp_dir/$profile_picture_filename";
+
+                if (!move_uploaded_file($national_id_file['tmp_name'], $national_id_path) || !move_uploaded_file($profile_picture_file['tmp_name'], $profile_picture_path)) {
+                    $error = "Failed to upload files. Please try again.";
+                } else {
+                    // Store data in session
+                    $_SESSION['temp_signup_data'] = [
+                        'first_name' => $first_name,
+                        'last_name' => $last_name,
+                        'username' => $username,
+                        'email' => $email,
+                        'phone' => $phone,
+                        'password' => password_hash($password, PASSWORD_BCRYPT),
+                        'gender' => $gender,
+                        'address' => $address,
+                        'location' => $location,
+                        'kin_name' => $kin_name,
+                        'kin_relationship' => $kin_relationship,
+                        'kin_phone' => $kin_phone,
+                        'age' => $age,
+                        'occupation' => $occupation,
+                        'national_id' => base64_encode(file_get_contents($national_id_path)),
+                        'profile_picture' => base64_encode(file_get_contents($profile_picture_path)),
+                        'national_id_path' => $national_id_path,
+                        'profile_picture_path' => $profile_picture_path
+                    ];
+
+                    $payment = initiateUSSDPayment($pdo, 0, 50, 'signup', null, $_SESSION['temp_signup_data']);
+                    if (isset($payment['error'])) {
+                        $payment_error = $payment['error'];
+                        $payment_type = $payment['type'];
+                        $temp_signup_data = $_SESSION['temp_signup_data'];
+                        @unlink($national_id_path);
+                        @unlink($profile_picture_path);
+                    } else {
+                        $user_id = $payment['user_id'];
+                        $adminStmt = $pdo->query("SELECT email FROM admins");
+                        while ($admin = $adminStmt->fetch()) {
+                            sendEmail($admin['email'], "New User Signup and Payment", "A new user ($username, $email) has paid the 500 Kwacha registration fee and signed up (charge_id: {$payment['charge_id']}). Please review and approve their account.");
+                        }
+                        @unlink($national_id_path);
+                        @unlink($profile_picture_path);
+                        unset($_SESSION['temp_signup_data']);
+                        header("Location: index.php?message=" . urlencode("Signup successful! Please wait for admin approval to access your account."));
+                        exit;
+                    }
+                }
+            }
+        }
+    }
+}
+
+// Handle forgot password
+if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_POST['forgot_password'])) {
+    if (!validateCsrfToken($_POST['csrf_token'])) {
+        $error = "Security error: Invalid CSRF token";
+    } else {
+        $email = filter_var($_POST['forgot_email'], FILTER_SANITIZE_EMAIL);
+
+        if (!filter_var($email, FILTER_VALIDATE_EMAIL)) {
+            $error = "Please enter a valid email address";
+        } else {
+            try {
+                $stmt = $pdo->prepare("SELECT * FROM users WHERE email = ?");
+                $stmt->execute([$email]);
+                $user = $stmt->fetch();
+
+                if ($user) {
+                    $reset_token = bin2hex(random_bytes(16));
+                    $stmt = $pdo->prepare("UPDATE users SET reset_token = ?, reset_token_expiry = DATE_ADD(NOW(), INTERVAL 1 HOUR) WHERE email = ?");
+                    $stmt->execute([$reset_token, $email]);
+
+                    $reset_link = "https://yourdomain.com/reset_password.php?token=$reset_token";
+                    $message = "Click the following link to reset your password: $reset_link";
+                    $success = sendEmail($email, "Password Reset Request", $message);
+
+                    if ($success) {
+                        header("Location: index.php?message=" . urlencode("Password reset link sent to your email"));
+                        exit;
+                    } else {
+                        $error = "Failed to send reset email. Please try again.";
+                    }
+                } else {
+                    $error = "No account found with that email address";
+                }
+            } catch (PDOException $e) {
+                error_log("Database error in forgot password: " . $e->getMessage());
+                $error = "Something went wrong. Please try again later.";
             }
         }
     }
@@ -151,9 +243,9 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_POST['signup'])) {
 // Handle booking
 if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_POST['book'])) {
     if (!validateCsrfToken($_POST['csrf_token'])) {
-        $error = "Invalid CSRF token";
+        $error = "Security error: Invalid CSRF token";
     } elseif (!isset($_SESSION['user_id'])) {
-        header("Location: index.php?message=Please login to book");
+        header("Location: index.php?message=Please log in to make a booking");
         exit;
     } else {
         $car_id = filter_var($_POST['car_id'], FILTER_SANITIZE_NUMBER_INT);
@@ -167,44 +259,43 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_POST['book'])) {
         $today_timestamp = strtotime($today);
 
         if ($pick_up_timestamp < $today_timestamp) {
-            header("Location: index.php?message=Pick-up date cannot be in the past");
-            exit;
-        }
-        if ($return_timestamp <= $pick_up_timestamp) {
-            header("Location: index.php?message=Return date must be after pick-up date");
-            exit;
-        }
-
-        $total_days = ($return_timestamp - $pick_up_timestamp) / (60 * 60 * 24);
-        $total_cost = $total_days * $price_per_day;
-        $booking_id = '#CR' . rand(1000, 9999);
-
-        // Store data temporarily in session
-        $_SESSION['temp_booking_data'] = [
-            'car_id' => $car_id,
-            'booking_id' => $booking_id,
-            'pick_up_date' => $pick_up_date,
-            'return_date' => $return_date,
-            'total_days' => $total_days,
-            'total_cost' => $total_cost,
-            'price_per_day' => $price_per_day
-        ];
-
-        // Get car name for error handling
-        $stmt = $pdo->prepare("SELECT name FROM cars WHERE id = ?");
-        $stmt->execute([$car_id]);
-        $car = $stmt->fetch();
-        $_SESSION['temp_booking_data']['car_name'] = $car['name'] ?? '';
-
-        $payment = initiateUSSDPayment($pdo, $_SESSION['user_id'], $total_cost, 'booking', null, $_SESSION['temp_booking_data']);
-        if (isset($payment['error'])) {
-            $payment_error = $payment['error'];
-            $payment_type = $payment['type'];
-            $temp_booking_data = $_SESSION['temp_booking_data'];
-            unset($_SESSION['temp_booking_data']);
+            $error = "Pick-up date must be today or later";
+        } elseif ($return_timestamp <= $pick_up_timestamp) {
+            $error = "Return date must be after the pick-up date";
         } else {
-            header("Location: index.php?message=" . urlencode($payment['message']));
-            exit;
+            $total_days = ($return_timestamp - $pick_up_timestamp) / (60 * 60 * 24);
+            $total_cost = $total_days * $price_per_day;
+            $booking_id = '#CR' . rand(1000, 9999);
+
+            $_SESSION['temp_booking_data'] = [
+                'car_id' => $car_id,
+                'booking_id' => $booking_id,
+                'pick_up_date' => $pick_up_date,
+                'return_date' => $return_date,
+                'total_days' => $total_days,
+                'total_cost' => $total_cost,
+                'price_per_day' => $price_per_day
+            ];
+
+            $stmt = $pdo->prepare("SELECT name FROM cars WHERE id = ?");
+            $stmt->execute([$car_id]);
+            $car = $stmt->fetch();
+            $_SESSION['temp_booking_data']['car_name'] = $car['name'] ?? '';
+
+            $payment = initiateUSSDPayment($pdo, $_SESSION['user_id'], $total_cost, 'booking', null, $_SESSION['temp_booking_data']);
+            if (isset($payment['error'])) {
+                $payment_error = $payment['error'];
+                $payment_type = $payment['type'];
+                $temp_booking_data = $_SESSION['temp_booking_data'];
+                unset($_SESSION['temp_booking_data']);
+            } else {
+                // Update car booking count
+                $stmt = $pdo->prepare("UPDATE cars SET booking_count = booking_count + 1 WHERE id = ?");
+                $stmt->execute([$car_id]);
+                unset($_SESSION['temp_booking_data']);
+                header("Location: index.php?message=" . urlencode($payment['message']));
+                exit;
+            }
         }
     }
 }
@@ -212,11 +303,13 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_POST['book'])) {
 // Handle profile update
 if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_POST['update_profile'])) {
     if (!validateCsrfToken($_POST['csrf_token'])) {
-        $error = "Invalid CSRF token";
+        $error = "Security error: Invalid CSRF token";
     } elseif (!isset($_SESSION['user_id'])) {
-        header("Location: index.php?message=Please login to update profile");
+        header("Location: index.php?message=Please log in to update your profile");
         exit;
     } else {
+        $first_name = filter_var($_POST['edit_first_name'], FILTER_SANITIZE_STRING);
+        $last_name = filter_var($_POST['edit_last_name'], FILTER_SANITIZE_STRING);
         $username = filter_var($_POST['edit_username'], FILTER_SANITIZE_STRING);
         $email = filter_var($_POST['edit_email'], FILTER_SANITIZE_EMAIL);
         $phone = $_POST['edit_phone'];
@@ -224,20 +317,44 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_POST['update_profile'])) {
         $address = filter_var($_POST['edit_address'], FILTER_SANITIZE_STRING);
         $location = $_POST['edit_location'];
         $age = filter_var($_POST['edit_age'], FILTER_SANITIZE_NUMBER_INT);
+        $occupation = filter_var($_POST['edit_occupation'], FILTER_SANITIZE_STRING);
 
-        if (!preg_match('/^0[0-9]{9}$/', $phone)) {
-            $error = "Invalid phone number format. Must be 10 digits starting with 0 (e.g., 0885620896).";
-        } elseif ($age < 18 || $age > 100) {
-            $error = "Age must be between 18 and 100.";
+        if (!preg_match('/^[A-Za-z]{2,50}$/', $first_name)) {
+            $error = "First name must be 2-50 letters only";
+        } elseif (!preg_match('/^[A-Za-z]{2,50}$/', $last_name)) {
+            $error = "Last name must be 2-50 letters only";
+        } elseif (!preg_match('/^[A-Za-z0-9_]{3,50}$/', $username)) {
+            $error = "Username must be 3-50 characters (letters, numbers, or underscores)";
+        } elseif (!filter_var($email, FILTER_VALIDATE_EMAIL)) {
+            $error = "Please enter a valid email address";
         } else {
-            try {
-                $stmt = $pdo->prepare("UPDATE users SET username = ?, email = ?, phone = ?, gender = ?, address = ?, location = ?, age = ? WHERE id = ?");
-                $stmt->execute([$username, $email, $phone, $gender, $address, $location, $age, $_SESSION['user_id']]);
-                header("Location: index.php?message=Profile updated successfully");
-                exit;
-            } catch (PDOException $e) {
-                error_log("Database error in profile update: " . $e->getMessage());
-                $error = "Database error: Unable to update profile. Please try again later.";
+            // Check if email is already used by another user
+            $stmt = $pdo->prepare("SELECT COUNT(*) FROM users WHERE email = ? AND id != ?");
+            $stmt->execute([$email, $_SESSION['user_id']]);
+            if ($stmt->fetchColumn() > 0) {
+                $error = "This email is already registered. Please use a different email.";
+            } elseif (!preg_match('/^0[0-9]{9}$/', $phone)) {
+                $error = "Phone number must be 10 digits starting with 0 (e.g., 0885620896)";
+            } elseif (!in_array($gender, ['Male', 'Female', 'Other'])) {
+                $error = "Please select a valid gender";
+            } elseif (empty($address)) {
+                $error = "Address is required";
+            } elseif (!in_array($location, ['Lilongwe', 'Blantyre', 'Mzuzu', 'Zomba'])) {
+                $error = "Please select a valid location";
+            } elseif ($age < 18 || $age > 100) {
+                $error = "Age must be between 18 and 100";
+            } elseif (empty($occupation)) {
+                $error = "Occupation is required";
+            } else {
+                try {
+                    $stmt = $pdo->prepare("UPDATE users SET first_name = ?, last_name = ?, username = ?, email = ?, phone = ?, gender = ?, address = ?, location = ?, age = ?, occupation = ? WHERE id = ?");
+                    $stmt->execute([$first_name, $last_name, $username, $email, $phone, $gender, $address, $location, $age, $occupation, $_SESSION['user_id']]);
+                    header("Location: index.php?message=Profile updated successfully");
+                    exit;
+                } catch (PDOException $e) {
+                    error_log("Database error in profile update: " . $e->getMessage());
+                    $error = "Unable to update profile. Please try again later.";
+                }
             }
         }
     }
@@ -246,13 +363,15 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_POST['update_profile'])) {
 // Handle contact form
 if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_POST['contact'])) {
     if (!validateCsrfToken($_POST['csrf_token'])) {
-        $error = "Invalid CSRF token";
+        $error = "Security error: Invalid CSRF token";
     } else {
         $email = filter_var($_POST['email'], FILTER_SANITIZE_EMAIL);
         $message = filter_var($_POST['message'], FILTER_SANITIZE_STRING);
 
         if (!filter_var($email, FILTER_VALIDATE_EMAIL)) {
-            $error = "Invalid email format";
+            $error = "Please enter a valid email address";
+        } elseif (empty($message)) {
+            $error = "Message cannot be empty";
         } else {
             $adminStmt = $pdo->query("SELECT email FROM admins");
             $success = true;
@@ -271,12 +390,11 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_POST['contact'])) {
     }
 }
 
-// Fetch cars for display with search and filter
+// Fetch cars with search and filter (only available cars)
 $search = isset($_GET['search']) ? filter_var(trim($_GET['search']), FILTER_SANITIZE_STRING) : '';
 $filter_fuel = isset($_GET['fuel']) ? filter_var(trim($_GET['fuel']), FILTER_SANITIZE_STRING) : '';
-$filter_status = isset($_GET['status']) ? filter_var(trim($_GET['status']), FILTER_SANITIZE_STRING) : '';
 
-$cars_query = "SELECT * FROM cars WHERE 1=1";
+$cars_query = "SELECT * FROM cars WHERE status = 'available'";
 $params = [];
 
 if ($search) {
@@ -284,31 +402,29 @@ if ($search) {
     $params[] = "%$search%";
     $params[] = "%$search%";
 }
-if ($filter_fuel) {
+if ($filter_fuel && in_array($filter_fuel, ['Petrol', 'Diesel', 'Electric'])) {
     $cars_query .= " AND fuel_type = ?";
     $params[] = $filter_fuel;
 }
-if ($filter_status) {
-    $cars_query .= " AND status = ?";
-    $params[] = $filter_status;
+
+try {
+    $carsStmt = $pdo->prepare($cars_query);
+    $carsStmt->execute($params);
+    $cars = $carsStmt->fetchAll();
+} catch (PDOException $e) {
+    error_log("Database error in car fetch: " . $e->getMessage());
+    $error = "Unable to fetch cars. Please try again later.";
 }
 
-$carsStmt = $pdo->prepare($cars_query);
-$carsStmt->execute($params);
-$cars = $carsStmt->fetchAll();
-
-// Fetch featured cars
-$featuredCarsStmt = $pdo->query("SELECT * FROM cars WHERE featured = 1 LIMIT 3");
+// Fetch featured cars (only available)
+$featuredCarsStmt = $pdo->query("SELECT * FROM cars WHERE featured = 1 AND status = 'available' LIMIT 3");
 $featuredCars = $featuredCarsStmt->fetchAll();
 
-// Fetch available cars for booking page
+// Fetch available cars
 $availableCarsStmt = $pdo->query("SELECT * FROM cars WHERE status = 'available'");
 $availableCars = $availableCarsStmt->fetchAll();
 
-// Get current date for JavaScript
 $current_date = date('Y-m-d');
-
-// Add PHP to output payment error and temp data for JavaScript
 $js_payment_error = json_encode($payment_error);
 $js_payment_type = json_encode($payment_type);
 $js_temp_signup_data = json_encode($temp_signup_data);
@@ -333,10 +449,54 @@ $js_temp_booking_data = json_encode($temp_booking_data);
         .profile-container { display: flex; align-items: center; }
         .profile-icon { font-size: 1.2rem; margin-right: 0.5rem; }
         .username { color: #fff; font-size: 1rem; }
-        .slider { flex-grow: 1; position: relative; overflow: hidden; height: 60vh; }
-        .slides { height: 100%; width: 400%; display: flex; transition: transform 0.5s ease; }
-        .slide { width: 100%; height: 100%; }
-        .slide img { width: 100%; height: 100%; object-fit: cover; }
+        .slider {
+    position: relative;
+    overflow: hidden;
+    height: 70vh; /* Increased from 60vh to make the slider taller */
+}
+
+.slides {
+    height: 100%;
+    display: flex;
+    transition: transform 0.5s ease;
+}
+
+.slide {
+    width: 100%;
+    height: 100%;
+    position: relative;
+}
+
+.slide img {
+    width: 100%;
+    height: 100%;
+    object-fit: cover;
+    border: 8px solid #fff;
+    border-radius: 12px;
+    box-shadow: 0 4px 20px rgba(0,0,0,0.2);
+    margin: 10px;
+}
+
+.slider-text {
+    position: absolute;
+    top: 50%;
+    left: 50%;
+    transform: translate(-50%, -50%);
+    text-align: center;
+    color: #fff;
+    background: rgba(0, 0, 0, 0.6); /* Added semi-transparent black background */
+    padding: 20px 40px; /* Added padding for better appearance */
+    border-radius: 10px; /* Rounded corners for the background */
+}
+
+.slider-text h2 {
+    font-size: 2.5rem;
+    margin-bottom: 1rem;
+}
+
+.slider-text p {
+    font-size: 1.2rem;
+}
         .modal { display: none; position: fixed; z-index: 1000; left: 0; top: 0; width: 100%; height: 100%; background-color: rgba(0,0,0,0.6); }
         .modal-content { position: fixed; top: 50%; left: 50%; transform: translate(-50%, -50%); background: white; padding: 2rem; border-radius: 12px; box-shadow: 0 4px 20px rgba(0,0,0,0.15); width: 600px; max-width: 95%; max-height: 90vh; overflow-y: auto; }
         .close { position: absolute; right: 20px; top: 10px; color: #aaa; font-size: 24px; font-weight: bold; cursor: pointer; }
@@ -346,23 +506,16 @@ $js_temp_booking_data = json_encode($temp_booking_data);
         form input:focus, form select:focus, form textarea:focus { border-color: #66fcf1; outline: none; }
         form button { width: 100%; background: #0b0c10; color: white; border: none; padding: 0.8rem; border-radius: 8px; cursor: pointer; font-size: 1rem; transition: background 0.3s ease; }
         form button:hover { background: #66fcf1; color: #0b0c10; }
+        form button:disabled { background: #ccc; cursor: not-allowed; }
         .alert { background: #ffdddd; border-left: 6px solid #f44336; padding: 10px; margin-bottom: 15px; }
         .success { background: #ddffdd; border-left: 6px solid #4caf50; padding: 10px; margin-bottom: 15px; }
         .inline-error { color: #f44336; font-size: 0.8rem; margin-top: -10px; margin-bottom: 10px; display: none; }
-        .about-content, .bookings-content, .booking-content { padding: 40px; max-width: 1200px; margin: 0 auto; }
-        .about-content h2, .bookings-content h2, .booking-content h2 { color: #0b0c10; margin-bottom: 20px; }
-        .about-content h3 { color: #45a29e; margin: 20px 0 10px; }
-        .about-content ul, .about-content ol { margin-left: 20px; margin-bottom: 15px; }
-        .about-content li { margin-bottom: 8px; }
-        footer { 
-            margin-top: auto; 
-            background: linear-gradient(90deg, #0b0c10, #1f2833); 
-            color: white; 
-            padding: 2rem; 
-            text-align: center; 
-            font-size: 0.9rem; 
-            box-shadow: 0 -2px 10px rgba(0,0,0,0.3);
-        }
+        .about-content, .bookings-content, .booking-content, .home-content { padding: 40px; max-width: 1200px; margin: 0 auto; }
+        .about-content h2, .bookings-content h2, .booking-content h2, .home-content h2 { color: #0b0c10; margin-bottom: 20px; }
+        .about-content h3, .home-content h3 { color: #45a29e; margin: 20px 0 10px; }
+        .about-content ul, .home-content ul { margin-left: 20px; margin-bottom: 15px; }
+        .about-content li, .home-content li { margin-bottom: 8px; }
+        footer { margin-top: auto; background: linear-gradient(90deg, #0b0c10, #1f2833); color: white; padding: 2rem; text-align: center; font-size: 0.9rem; box-shadow: 0 -2px 10px rgba(0,0,0,0.3); }
         footer .social-icons { margin-top: 1rem; }
         footer .social-icons a { color: #66fcf1; margin: 0 0.5rem; font-size: 1.2rem; transition: color 0.3s ease; }
         footer .social-icons a:hover { color: #45a29e; }
@@ -379,355 +532,53 @@ $js_temp_booking_data = json_encode($temp_booking_data);
         form input:hover, form select:hover, form textarea:hover { border-color: #66fcf1; }
 
         /* Cars Section Styles */
-        .slider-container {
-            overflow-x: auto;
-            white-space: nowrap;
-            background: #0b0c10;
-            padding: 1rem 0;
-        }
-        .slider-container img {
-            width: 280px;
-            height: 160px;
-            margin: 0 10px;
-            border-radius: 10px;
-            display: inline-block;
-            object-fit: cover;
-        }
-        .section-header {
-            padding: 2rem;
-            font-size: 1.6rem;
-            color: #0b0c10;
-            text-align: center;
-        }
-        .controls {
-            display: flex;
-            flex-direction: row;
-            justify-content: center;
-            align-items: center;
-            gap: 1rem;
-            margin: 1rem auto;
-            flex-wrap: nowrap;
-            max-width: 1200px;
-            padding: 0 1rem;
-            overflow-x: auto;
-            white-space: nowrap;
-        }
-        .controls input[type="text"],
-        .controls select,
-        .controls button {
-            padding: 0.5rem 1rem;
-            border-radius: 8px;
-            border: 1px solid #ccc;
-            font-size: 1rem;
-            height: 40px;
-            box-sizing: border-box;
-            flex-shrink: 0;
-        }
-        .controls input[type="text"] {
-            flex: 2;
-            min-width: 150px;
-        }
-        .controls select {
-            flex: 1;
-            min-width: 120px;
-        }
-        .controls button {
-            background: #0b0c10;
-            color: #fff;
-            border: none;
-            cursor: pointer;
-            flex: 1;
-            min-width: 80px;
-        }
-        .controls button:hover {
-            background: #66fcf1;
-            color: #0b0c10;
-        }
-        .grid-container {
-            display: grid;
-            grid-template-columns: repeat(3, 1fr);
-            gap: 1.5rem;
-            padding: 2rem;
-            max-width: 1200px;
-            margin: 0 auto;
-        }
-        .car-card {
-            background: white;
-            border-radius: 12px;
-            box-shadow: 0 4px 20px rgba(0,0,0,0.05);
-            overflow: hidden;
-            transition: transform 0.3s ease;
-            display: flex;
-            flex-direction: column;
-            height: 100%;
-            max-width: 360px;
-            margin: 0 auto;
-        }
-        .car-card:hover {
-            transform: translateY(-5px);
-        }
-        .car-card img {
-            width: 100%;
-            height: 160px;
-            object-fit: cover;
-        }
-        .car-card .details {
-            padding: 1rem;
-            flex-grow: 1;
-        }
-        .car-card h3 {
-            margin-bottom: 0.5rem;
-            color: #0b0c10;
-            font-size: 1.1rem;
-            white-space: nowrap;
-            overflow: hidden;
-            text-overflow: ellipsis;
-        }
-        .car-card p {
-            font-size: 0.85rem;
-            color: #555;
-            margin-bottom: 0.5rem;
-            line-height: 1.4;
-        }
-        .car-card button {
-            margin: 0.5rem 1rem 1rem;
-            padding: 0.5rem 1rem;
-            background: #66fcf1;
-            border: none;
-            border-radius: 8px;
-            cursor: pointer;
-            color: #0b0c10;
-            font-weight: bold;
-            transition: background 0.3s ease, color 0.3s ease;
-            width: calc(100% - 2rem);
-        }
-        .car-card button:hover {
-            background: #0b0c10;
-            color: #66fcf1;
-        }
-        .car-card button:disabled {
-            background: #ccc;
-            cursor: not-allowed;
-        }
-        .car-card .signup-info {
-            margin: 0.5rem 1rem 1rem;
-            color: #721c24;
-            font-size: 0.8rem;
-            font-style: italic;
-            text-align: center;
-        }
+        .slider-container { overflow-x: auto; white-space: nowrap; background: #0b0c10; padding: 1rem 0; }
+        .slider-container img { width: 280px; height: 160px; margin: 0 10px; border-radius: 10px; display: inline-block; object-fit: cover; }
+        .section-header { padding: 2rem; font-size: 1.6rem; color: #0b0c10; text-align: center; }
+        .controls { display: flex; flex-direction: row; justify-content: center; align-items: center; gap: 1rem; margin: 1rem auto; max-width: 1200px; padding: 0 1rem; }
+        .controls form { flex-direction: row; align-items: center; gap: 1rem; }
+        .controls input[type="text"], .controls select, .controls button { padding: 0.5rem 1rem; border-radius: 8px; border: 1px solid #ccc; font-size: 1rem; height: 40px; box-sizing: border-box; }
+        .controls input[type="text"] { flex: 2; min-width: 150px; }
+        .controls select { flex: 1; min-width: 120px; }
+        .controls button { background: #0b0c10; color: #fff; border: none; cursor: pointer; flex: 1; min-width: 80px; }
+        .controls button:hover { background: #66fcf1; color: #0b0c10; }
+        .grid-container { display: grid; grid-template-columns: repeat(3, 1fr); gap: 1.5rem; padding: 2rem; max-width: 1200px; margin: 0 auto; }
+        .car-card { background: white; border-radius: 12px; box-shadow: 0 4px 20px rgba(0,0,0,0.05); overflow: hidden; transition: transform 0.3s ease; display: flex; flex-direction: column; height: 100%; max-width: 360px; margin: 0 auto; }
+        .car-card:hover { transform: translateY(-5px); }
+        .car-card img { width: 100%; height: 160px; object-fit: cover; }
+        .car-card .details { padding: 1rem; flex-grow: 1; }
+        .car-card h3 { margin-bottom: 0.5rem; color: #0b0c10; font-size: 1.1rem; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+        .car-card p { font-size: 0.85rem; color: #555; margin-bottom: 0.5rem; line-height: 1.4; }
+        .car-card button { margin: 0.5rem 1rem 1rem; padding: 0.5rem 1rem; background: #66fcf1; border: none; border-radius: 8px; cursor: pointer; color: #0b0c10; font-weight: bold; transition: background 0.3s ease, color 0.3s ease; width: calc(100% - 2rem); }
+        .car-card button:hover { background: #0b0c10; color: #66fcf1; }
+        .car-card button:disabled { background: #ccc; cursor: not-allowed; }
+        .car-card .signup-info { margin: 0.5rem 1rem 1rem; color: #721c24; font-size: 0.8rem; font-style: italic; text-align: center; }
 
-        /* Responsive Design */
-        @media (max-width: 992px) {
-            .grid-container {
-                grid-template-columns: repeat(2, 1fr);
-                gap: 1rem;
-            }
-            .car-card {
-                max-width: 100%;
-            }
-            .car-card img {
-                height: 150px;
-            }
-            .slider-container img {
-                width: 260px;
-                height: 150px;
-            }
-            .controls {
-                gap: 0.5rem;
-                padding: 0 0.5rem;
-            }
-            .controls input[type="text"],
-            .controls select,
-            .controls button {
-                font-size: 0.9rem;
-                padding: 0.4rem 0.8rem;
-                height: 36px;
-            }
-            .controls input[type="text"] {
-                min-width: 120px;
-            }
-            .controls select {
-                min-width: 100px;
-            }
-            .controls button {
-                min-width: 70px;
-            }
-        }
-
-        @media (max-width: 600px) {
-            .grid-container {
-                grid-template-columns: 1fr;
-                gap: 1rem;
-                padding: 1rem;
-            }
-            .car-card {
-                max-width: 100%;
-            }
-            .car-card img {
-                height: 140px;
-            }
-            .car-card h3 {
-                font-size: 1rem;
-            }
-            .car-card p {
-                font-size: 0.8rem;
-            }
-            .car-card button {
-                font-size: 0.9rem;
-                padding: 0.4rem 0.8rem;
-            }
-            .slider-container img {
-                width: 240px;
-                height: 140px;
-            }
-            .controls {
-                flex-direction: row;
-                gap: 0.3rem;
-                flex-wrap: nowrap;
-                overflow-x: auto;
-                white-space: nowrap;
-                padding: 0.5rem;
-            }
-            .controls input[type="text"],
-            .controls select,
-            .controls button {
-                font-size: 0.8rem;
-                padding: 0.3rem 0.6rem;
-                height: 32px;
-            }
-            .controls input[type="text"] {
-                min-width: 100px;
-            }
-            .controls select {
-                min-width: 80px;
-            }
-            .controls button {
-                min-width: 60px;
-            }
-        }
+        /* Home Section Styles */
+        .home-content { text-align: center; }
+        .home-content p { font-size: 1.1rem; line-height: 1.6; color: #555; margin-bottom: 20px; }
+        .home-content .cta-button { display: inline-block; background: #0b0c10; color: white; padding: 12px 24px; border-radius: 8px; text-decoration: none; font-weight: bold; transition: background 0.3s ease, color 0.3s ease; }
+        .home-content .cta-button:hover { background: #66fcf1; color: #0b0c10; }
 
         /* Signup Modal Styles */
-        #signupModal .modal-content {
-            background: #ffffff;
-            border: 2px solid #0b0c10;
-            border-radius: 15px;
-            padding: 2.5rem;
-            width: 600px;
-            max-width: 95%;
-        }
-        #signupModal h2 {
-            color: #0b0c10;
-            font-size: 1.8rem;
-            margin-bottom: 1.5rem;
-            text-align: center;
-        }
-        #signupModal h3 {
-            color: #45a29e;
-            font-size: 1.2rem;
-            margin-bottom: 1rem;
-            border-top: none;
-        }
-        #signupModal .signup-progress {
-            display: flex;
-            justify-content: space-between;
-            background: #f4f6f8;
-            padding: 10px;
-            border-radius: 10px;
-            margin-bottom: 1.5rem;
-        }
-        #signupModal .progress-step {
-            background: #ffffff;
-            color: #0b0c10;
-            border: 2px solid #66fcf1;
-            box-shadow: 0 2px 5px rgba(0,0,0,0.1);
-            font-size: 0.9rem;
-            padding: 8px;
-            flex: 1;
-            text-align: center;
-            margin: 0 5px;
-            border-radius: 8px;
-            transition: background 0.3s ease, color 0.3s ease;
-        }
-        #signupModal .progress-step.active {
-            background: #0b0c10;
-            color: #66fcf1;
-            border-color: #0b0c10;
-        }
-        #signupModal form label {
-            color: #45a29e;
-            font-size: 0.95rem;
-            font-weight: 600;
-        }
-        #signupModal form input,
-        #signupModal form select,
-        #signupModal form input[type="file"] {
-            background: #f4f6f8;
-            border: 1px solid #cccccc;
-            border-radius: 6px;
-            padding: 12px;
-            font-size: 0.95rem;
-            transition: border-color 0.3s ease, background 0.3s ease;
-        }
-        #signupModal form input:focus,
-        #signupModal form select:focus,
-        #signupModal form input[type="file"]:focus {
-            border-color: #66fcf1;
-            background: #ffffff;
-        }
-        #signupModal form input:hover,
-        #signupModal form select:hover,
-        #signupModal form input[type="file"]:hover {
-            border-color: #66fcf1;
-        }
-        #signupModal form input[type="file"] {
-            border-style: dashed;
-            border-color: #45a29e;
-            background: #f9f9f9;
-        }
-        #signupModal .inline-error {
-            color: #d32f2f;
-            font-size: 0.75rem;
-            font-style: italic;
-            margin-top: -8px;
-        }
-        #signupModal .step-buttons {
-            display: flex;
-            gap: 15px;
-            justify-content: space-between;
-        }
-        #signupModal .step-buttons button {
-            width: 48%;
-        }
-        #signupModal .form-links a {
-            color: #45a29e;
-        }
-        #signupModal .form-links a:hover {
-            color: #66fcf1;
-        }
-        #signupModal .profile-picture-preview { 
-            margin: 10px 0; 
-            max-width: 100px; 
-            max-height: 100px; 
-            border-radius: 8px; 
-            display: none; 
-        }
-
-        /* Responsive Design */
-        @media (max-width: 768px) {
-            .controls { flex-direction: column; align-items: center; }
-            .controls input[type="text"], .controls select, .controls button { width: 100%; margin-bottom: 0.5rem; }
-            #signupModal .modal-content { width: 90%; padding: 1.5rem; }
-            #signupModal .signup-progress { flex-direction: column; gap: 10px; }
-            #signupModal .progress-step { margin: 0; font-size: 0.8rem; }
-            #signupModal h2 { font-size: 1.5rem; }
-            #signupModal form label { font-size: 0.9rem; }
-            #signupModal form input,
-            #signupModal form select,
-            #signupModal form input[type="file"] { font-size: 0.9rem; padding: 10px; }
-            #signupModal .step-buttons { flex-direction: column; }
-            #signupModal .step-buttons button { width: 100%; }
-        }
+        #signupModal .modal-content { background: #ffffff; border: 2px solid #0b0c10; border-radius: 15px; padding: 2.5rem; width: 600px; max-width: 95%; }
+        #signupModal h2 { color: #0b0c10; font-size: 1.8rem; margin-bottom: 1.5rem; text-align: center; }
+        #signupModal h3 { color: #45a29e; font-size: 1.2rem; margin-bottom: 1rem; border-top: none; }
+        #signupModal .signup-progress { display: flex; justify-content: space-between; background: #f4f6f8; padding: 10px; border-radius: 10px; margin-bottom: 1.5rem; }
+        #signupModal .progress-step { background: #ffffff; color: #0b0c10; border: 2px solid #66fcf1; box-shadow: 0 2px 5px rgba(0,0,0,0.1); font-size: 0.9rem; padding: 8px; flex: 1; text-align: center; margin: 0 5px; border-radius: 8px; transition: background 0.3s ease, color 0.3s ease; }
+        #signupModal .progress-step.active { background: #0b0c10; color: #66fcf1; border-color: #0b0c10; }
+        #signupModal .form-group { margin-bottom: 1.2rem; }
+        #signupModal .form-group label { display: block; color: #45a29e; font-size: 0.95rem; font-weight: 600; margin-bottom: 8px; }
+        #signupModal .form-group input, #signupModal .form-group select, #signupModal .form-group input[type="file"] { width: 100%; background: #f8f9fa; border: 1px solid #cccccc; border-radius: 8px; padding: 12px; font-size: 0.95rem; transition: border-color 0.3s ease, background 0.3s ease; }
+        #signupModal .form-group input:focus, #signupModal .form-group select:focus, #signupModal .form-group input[type="file"]:focus { border-color: #66fcf1; background: #ffffff; outline: none; }
+        #signupModal .form-group input:hover, #signupModal .form-group select:hover, #signupModal .form-group input[type="file"]:hover { border-color: #66fcf1; }
+        #signupModal .form-group input[type="file"] { border-style: dashed; border-color: #45a29e; background: #f9f9f9; cursor: pointer; }
+        #signupModal .inline-error { color: #d32f2f; font-size: 0.75rem; font-style: italic; margin-top: 4px; }
+        #signupModal .step-buttons { display: flex; gap: 15px; justify-content: space-between; }
+        #signupModal .step-buttons button { width: 48%; }
+        #signupModal .form-links a { color: #45a29e; }
+        #signupModal .form-links a:hover { color: #66fcf1; }
+        #signupModal .profile-picture-preview { margin: 10px 0; max-width: 100px; max-height: 100px; border-radius: 8px; display: none; }
 
         /* Profile and Bookings Styles */
         .profile-content, .bookings-content, .booking-content { padding: 40px; max-width: 1200px; margin: 0 auto; }
@@ -745,6 +596,47 @@ $js_temp_booking_data = json_encode($temp_booking_data);
         .edit-profile-btn:hover, .new-booking-btn:hover { background: #66fcf1; color: #0b0c10; }
         .booking-form { background: white; padding: 20px; border-radius: 12px; box-shadow: 0 4px 20px rgba(0,0,0,0.05); margin-bottom: 2rem; }
         .booking-form h3 { color: #45a29e; margin-bottom: 1rem; }
+
+        /* Responsive Design */
+        @media (max-width: 992px) {
+            .grid-container { grid-template-columns: repeat(2, 1fr); gap: 1rem; }
+            .car-card { max-width: 100%; }
+            .car-card img { height: 150px; }
+            .slider-container img { width: 260px; height: 150px; }
+            .controls { gap: 0.5rem; padding: 0 0.5rem; }
+            .controls input[type="text"], .controls select, .controls button { font-size: 0.9rem; padding: 0.4rem 0.8rem; height: 36px; }
+            .controls input[type="text"] { min-width: 120px; }
+            .controls select { min-width: 100px; }
+            .controls button { min-width: 70px; }
+            .slide img { border-width: 6px; margin: 8px; }
+            .slider-text h2 { font-size: 2rem; }
+            .slider-text p { font-size: 1rem; }
+        }
+        @media (max-width: 600px) {
+            .grid-container { grid-template-columns: 1fr; gap: 1rem; padding: 1rem; }
+            .car-card { max-width: 100%; }
+            .car-card img { height: 140px; }
+            .car-card h3 { font-size: 1rem; }
+            .car-card p { font-size: 0.8rem; }
+            .car-card button { font-size: 0.9rem; padding: 0.4rem 0.8rem; }
+            .slider-container img { width: 240px; height: 140px; }
+            .controls { flex-wrap: wrap; gap: 0.3rem; padding: 0.5rem; }
+            .controls input[type="text"], .controls select, .controls button { font-size: 0.8rem; padding: 0.3rem 0.6rem; height: 32px; width: auto; }
+            .controls input[type="text"] { min-width: 100px; }
+            .controls select { min-width: 80px; }
+            .controls button { min-width: 60px; }
+            .slide img { border-width: 4px; margin: 6px; }
+            .slider-text h2 { font-size: 1.5rem; }
+            .slider-text p { font-size: 0.9rem; }
+            #signupModal .modal-content { width: 90%; padding: 1.5rem; }
+            #signupModal .signup-progress { flex-direction: column; gap: 10px; }
+            #signupModal .progress-step { margin: 0; font-size: 0.8rem; }
+            #signupModal h2 { font-size: 1.5rem; }
+            #signupModal .form-group label { font-size: 0.9rem; }
+            #signupModal .form-group input, #signupModal .form-group select, #signupModal .form-group input[type="file"] { font-size: 0.9rem; padding: 10px; }
+            #signupModal .step-buttons { flex-direction: column; }
+            #signupModal .step-buttons button { width: 100%; }
+        }
     </style>
 </head>
 <body>
@@ -780,32 +672,20 @@ $js_temp_booking_data = json_encode($temp_booking_data);
     <section id="home">
         <div class="slider">
             <div class="slides">
-                <div class="slide"><img src="https://via.placeholder.com/1200x600?text=Car+1" alt="Car 1"></div>
-                <div class="slide"><img src="https://via.placeholder.com/1200x600?text=Car+2" alt="Car 2"></div>
-                <div class="slide"><img src="https://via.placeholder.com/1200x600?text=Car+3" alt="Car 3"></div>
-                <div class="slide"><img src="https://via.placeholder.com/1200x600?text=Car+4" alt="Car 4"></div>
+                <div class="slide"><img src="Image1.jpg" alt="Car 1"></div>
+                <div class="slide"><img src="Image2.jpg" alt="Car 2"></div>
+                <div class="slide"><img src="Image3.jpg" alt="Car 3"></div>
+                <div class="slide"><img src="Image4.jpg" alt="Car 4"></div>
+            </div>
+            <div class="slider-text">
+                <h2>MIBESA Car Rental</h2>
+                <p>Rent your perfect car today!</p>
             </div>
         </div>
-        <div class="about-content">
-            <h2>About Us</h2>
-            <p>MIBESA Car Rental is committed to providing quality and affordable car rental services tailored to your needs. Our fleet includes a wide range of vehicles suitable for every occasion.</p>
-            <h3>Our Services</h3>
-            <ul>
-                <li>Peer-to-peer car rental services</li>
-                <li>Secure payment processing</li>
-                <li>Verified user profiles</li>
-                <li>24/7 customer support</li>
-                <li>Comprehensive insurance coverage</li>
-            </ul>
-            <h3>How It Works</h3>
-            <p>Getting started is simple:</p>
-            <ol>
-                <li>Create an account and complete verification</li>
-                <li>Browse available vehicles</li>
-                <li>Make your booking</li>
-                <li>Process secure payment</li>
-                <li>Enjoy your ride</li>
-            </ol>
+        <div class="home-content">
+            <h2>Explore Our Fleet</h2>
+            <p>Choose from a variety of vehicles for any journey. Book now for a seamless rental experience.</p>
+            <a href="#" onclick="showSection('cars')" class="cta-button">View Cars</a>
         </div>
     </section>
 
@@ -825,17 +705,17 @@ $js_temp_booking_data = json_encode($temp_booking_data);
                         <p>Model: <?php echo htmlspecialchars($car['model']); ?> | Fuel: <?php echo htmlspecialchars($car['fuel_type']); ?> | Capacity: <?php echo htmlspecialchars($car['capacity']); ?> Seater</p>
                         <p>Price: <?php echo htmlspecialchars($car['price_per_day'] ?? '50'); ?> Kwacha/day</p>
                     </div>
-                    <?php if ($car['status'] == 'available' && isset($_SESSION['user_id']) && $user && $user['status'] == 'approved'): ?>
+                    <?php if (isset($_SESSION['user_id']) && $user && $user['status'] == 'approved'): ?>
                         <button onclick="showBookingModal(<?php echo $car['id']; ?>, '<?php echo htmlspecialchars($car['name']); ?>', <?php echo htmlspecialchars($car['price_per_day'] ?? '50'); ?>)">Book Now</button>
                     <?php else: ?>
-                        <p class="signup-info"><?php echo $car['status'] == 'booked' ? 'Booked' : 'Login and get approved to book'; ?></p>
+                        <p class="signup-info">Please log in and get approved to book</p>
                     <?php endif; ?>
                 </div>
             <?php endforeach; ?>
         </div>
         <h2 class="section-header">All Available Cars</h2>
         <div class="controls">
-            <form method="GET" action="index.php" style="display: flex; flex-wrap: wrap; gap: 1rem; align-items: center;">
+            <form method="GET" action="index.php">
                 <input type="hidden" name="section" value="cars">
                 <input type="text" name="search" placeholder="Search by name or model..." value="<?php echo htmlspecialchars($search); ?>">
                 <select name="fuel">
@@ -843,11 +723,6 @@ $js_temp_booking_data = json_encode($temp_booking_data);
                     <option value="Petrol" <?php echo $filter_fuel == 'Petrol' ? 'selected' : ''; ?>>Petrol</option>
                     <option value="Diesel" <?php echo $filter_fuel == 'Diesel' ? 'selected' : ''; ?>>Diesel</option>
                     <option value="Electric" <?php echo $filter_fuel == 'Electric' ? 'selected' : ''; ?>>Electric</option>
-                </select>
-                <select name="status">
-                    <option value="">All Statuses</option>
-                    <option value="available" <?php echo $filter_status == 'available' ? 'selected' : ''; ?>>Available</option>
-                    <option value="booked" <?php echo $filter_status == 'booked' ? 'selected' : ''; ?>>Booked</option>
                 </select>
                 <button type="submit">Search</button>
                 <button type="button" onclick="window.location.href='index.php?section=cars'">Clear</button>
@@ -862,10 +737,10 @@ $js_temp_booking_data = json_encode($temp_booking_data);
                         <p>Model: <?php echo htmlspecialchars($car['model']); ?> | Fuel: <?php echo htmlspecialchars($car['fuel_type']); ?> | Capacity: <?php echo htmlspecialchars($car['capacity']); ?> Seater</p>
                         <p>Price: <?php echo htmlspecialchars($car['price_per_day'] ?? '50'); ?> Kwacha/day</p>
                     </div>
-                    <?php if ($car['status'] == 'available' && isset($_SESSION['user_id']) && $user && $user['status'] == 'approved'): ?>
+                    <?php if (isset($_SESSION['user_id']) && $user && $user['status'] == 'approved'): ?>
                         <button onclick="showBookingModal(<?php echo $car['id']; ?>, '<?php echo htmlspecialchars($car['name']); ?>', <?php echo htmlspecialchars($car['price_per_day'] ?? '50'); ?>)">Book Now</button>
                     <?php else: ?>
-                        <p class="signup-info"><?php echo $car['status'] == 'booked' ? 'Booked' : 'Login and get approved to book'; ?></p>
+                        <p class="signup-info">Please log in and get approved to book</p>
                     <?php endif; ?>
                 </div>
             <?php endforeach; ?>
@@ -875,19 +750,16 @@ $js_temp_booking_data = json_encode($temp_booking_data);
     <section id="about" style="display:none;">
         <div class="about-content">
             <h2>About MIBESA</h2>
-            <p>MIBESA Car Rental is committed to providing quality and affordable car rental services tailored to your needs. Our fleet includes a wide range of vehicles suitable for every occasion.</p>
+            <p>MIBESA Car Rental is committed to providing quality and affordable car rental services tailored to your needs.</p>
             <h3>Our Mission</h3>
-            <p>To offer reliable, convenient, and affordable car rental services while ensuring the highest standards of customer satisfaction and safety.</p>
+            <p>To offer reliable, convenient, and affordable car rental services with high customer satisfaction.</p>
             <h3>Why Choose Us?</h3>
             <ul>
                 <li>Wide selection of vehicles</li>
                 <li>Competitive pricing</li>
                 <li>Secure payment processing</li>
                 <li>24/7 customer support</li>
-                <li>Comprehensive insurance coverage</li>
             </ul>
-            <h3>Our Team</h3>
-            <p>Our team consists of experienced professionals dedicated to providing the best car rental experience. From customer service to technical support, we are here to assist you every step of the way.</p>
         </div>
     </section>
 
@@ -898,10 +770,10 @@ $js_temp_booking_data = json_encode($temp_booking_data);
                 <input type="hidden" name="csrf_token" value="<?php echo htmlspecialchars($_SESSION['csrf_token']); ?>">
                 <label for="contact_email">Email:</label>
                 <input type="email" id="contact_email" name="email" required aria-describedby="emailError">
-                <span class="inline-error" id="emailError">Valid email required.</span>
+                <span class="inline-error" id="emailError">Please enter a valid email address</span>
                 <label for="contact_message">Message:</label>
                 <textarea id="contact_message" name="message" required aria-describedby="messageError"></textarea>
-                <span class="inline-error" id="messageError">Message is required.</span>
+                <span class="inline-error" id="messageError">Message cannot be empty</span>
                 <button type="submit" name="contact">Send Message</button>
             </form>
         </div>
@@ -963,7 +835,7 @@ $js_temp_booking_data = json_encode($temp_booking_data);
         <div class="booking-content">
             <h2>New Booking</h2>
             <?php if (empty($availableCars)): ?>
-                <div class="alert">No cars available for booking at the moment. Please check back later.</div>
+                <div class="alert">No cars available for booking at the moment.</div>
             <?php else: ?>
                 <div class="booking-form">
                     <form id="newBookingForm" method="POST">
@@ -977,17 +849,17 @@ $js_temp_booking_data = json_encode($temp_booking_data);
                                 </option>
                             <?php endforeach; ?>
                         </select>
-                        <span class="inline-error" id="bookingCarIdError">Please select a car.</span>
+                        <span class="inline-error" id="bookingCarIdError">Please select a car</span>
                         <label for="carName">Car Name:</label>
                         <input type="text" id="carName" readonly>
                         <label for="pricePerDay">Price per Day (Kwacha):</label>
                         <input type="text" id="pricePerDay" name="price_per_day" readonly>
                         <label for="pick_up_date">Pick-up Date:</label>
                         <input type="date" id="pick_up_date" name="pick_up_date" required aria-describedby="pickUpDateError">
-                        <span class="inline-error" id="pickUpDateError">Pick-up date must be today or later.</span>
+                        <span class="inline-error" id="pickUpDateError">Pick-up date must be today or later</span>
                         <label for="return_date">Return Date:</label>
                         <input type="date" id="return_date" name="return_date" required aria-describedby="returnDateError">
-                        <span class="inline-error" id="returnDateError">Return date must be after pick-up date.</span>
+                        <span class="inline-error" id="returnDateError">Return date must be after pick-up date</span>
                         <label for="totalCost">Total Cost:</label>
                         <input type="text" id="totalCost" readonly>
                         <button type="submit" name="book">Book Now</button>
@@ -1010,6 +882,10 @@ $js_temp_booking_data = json_encode($temp_booking_data);
             <button class="edit-profile-btn" onclick="showEditProfileModal()">Edit Profile</button>
             <div class="profile-details">
                 <div class="detail-item">
+                    <label>Name:</label>
+                    <p><?php echo htmlspecialchars(($user['first_name'] ?? '') . ' ' . ($user['last_name'] ?? '')); ?></p>
+                </div>
+                <div class="detail-item">
                     <label>Phone:</label>
                     <p><?php echo htmlspecialchars($user['phone'] ?? 'Not set'); ?></p>
                 </div>
@@ -1020,6 +896,10 @@ $js_temp_booking_data = json_encode($temp_booking_data);
                 <div class="detail-item">
                     <label>Age:</label>
                     <p><?php echo htmlspecialchars($user['age'] ?? 'Not set'); ?></p>
+                </div>
+                <div class="detail-item">
+                    <label>Occupation:</label>
+                    <p><?php echo htmlspecialchars($user['occupation'] ?? 'Not set'); ?></p>
                 </div>
                 <div class="detail-item">
                     <label>Address:</label>
@@ -1092,14 +972,16 @@ $js_temp_booking_data = json_encode($temp_booking_data);
                 <input type="hidden" name="csrf_token" value="<?php echo htmlspecialchars($_SESSION['csrf_token']); ?>">
                 <label for="loginEmail">Email:</label>
                 <input type="email" id="loginEmail" name="loginEmail" required aria-describedby="loginEmailError">
-                <span class="inline-error" id="loginEmailError">Valid email required.</span>
+                <span class="inline-error" id="loginEmailError">Please enter a valid email address</span>
                 <label for="loginPassword">Password:</label>
                 <input type="password" id="loginPassword" name="loginPassword" required aria-describedby="loginPasswordError">
-                <span class="inline-error" id="loginPasswordError">Password is required.</span>
+                <span class="inline-error" id="loginPasswordError">Password cannot be empty</span>
                 <button type="submit" name="login">Login</button>
             </form>
             <div class="form-links">
                 <a href="#" id="showSignup">Don't have an account? Sign Up</a>
+                <span class="separator">|</span>
+                <a href="#" id="showForgotPassword">Forgot Password?</a>
             </div>
         </div>
     </div>
@@ -1109,6 +991,7 @@ $js_temp_booking_data = json_encode($temp_booking_data);
         <div class="modal-content">
             <span class="close" data-target="signupModal">×</span>
             <h2>Sign Up</h2>
+            <p style="color: #d32f2f; font-style: italic; margin-bottom: 1rem;">Note: A registration fee of 500 Malawi Kwacha is required to complete signup.</p>
             <div class="signup-progress">
                 <div class="progress-step active" id="progress1">1. Personal Info</div>
                 <div class="progress-step" id="progress2">2. Contact Info</div>
@@ -1120,52 +1003,84 @@ $js_temp_booking_data = json_encode($temp_booking_data);
                 <!-- Step 1 -->
                 <div class="step" id="step1">
                     <h3>Personal Information</h3>
-                    <label for="signupUsername">Username:</label>
-                    <input type="text" id="signupUsername" name="username" required aria-describedby="signupUsernameError" minlength="3" maxlength="50" pattern="[A-Za-z0-9_]+" title="Username can only contain letters, numbers, and underscores">
-                    <span class="inline-error" id="signupUsernameError">Username must be 3-50 characters, using letters, numbers, or underscores.</span>
-                    <label for="signupEmail">Email:</label>
-                    <input type="email" id="signupEmail" name="email" required aria-describedby="signupEmailError">
-                    <span class="inline-error" id="signupEmailError">Valid email required.</span>
-                    <label for="signupPassword">Password:</label>
-                    <input type="password" id="signupPassword" name="password" required aria-describedby="signupPasswordError" minlength="8">
-                    <span class="inline-error" id="signupPasswordError">Password must be at least 8 characters.</span>
-                    <label for="confirmPassword">Confirm Password:</label>
-                    <input type="password" id="confirmPassword" name="confirm_password" required aria-describedby="confirmPasswordError">
-                    <span class="inline-error" id="confirmPasswordError">Passwords do not match.</span>
-                    <label for="signupAge">Age:</label>
-                    <input type="number" id="signupAge" name="age" min="18" max="100" required aria-describedby="signupAgeError">
-                    <span class="inline-error" id="signupAgeError">Age must be between 18 and 100.</span>
+                    <div class="form-group">
+                        <label for="first_name">First Name:</label>
+                        <input type="text" id="first_name" name="first_name" required aria-describedby="firstNameError" minlength="2" maxlength="50" pattern="[A-Za-z]+" title="First name can only contain letters">
+                        <span class="inline-error" id="firstNameError">First name must be 2-50 letters only</span>
+                    </div>
+                    <div class="form-group">
+                        <label for="last_name">Last Name:</label>
+                        <input type="text" id="last_name" name="last_name" required aria-describedby="lastNameError" minlength="2" maxlength="50" pattern="[A-Za-z]+" title="Last name can only contain letters">
+                        <span class="inline-error" id="lastNameError">Last name must be 2-50 letters only</span>
+                    </div>
+                    <div class="form-group">
+                        <label for="signupUsername">Username:</label>
+                        <input type="text" id="signupUsername" name="username" required aria-describedby="signupUsernameError" minlength="3" maxlength="50" pattern="[A-Za-z0-9_]+" title="Username can only contain letters, numbers, and underscores">
+                        <span class="inline-error" id="signupUsernameError">Username must be 3-50 characters (letters, numbers, or underscores)</span>
+                    </div>
+                    <div class="form-group">
+                        <label for="signupEmail">Email:</label>
+                        <input type="email" id="signupEmail" name="email" required aria-describedby="signupEmailError">
+                        <span class="inline-error" id="signupEmailError">Please enter a valid email address</span>
+                    </div>
+                    <div class="form-group">
+                        <label for="signupPassword">Password:</label>
+                        <input type="password" id="signupPassword" name="password" required aria-describedby="signupPasswordError" minlength="8" pattern="(?=.*[a-z])(?=.*[A-Z])(?=.*\d)(?=.*[@$!%*?&])[A-Za-z\d@$!%*?&]{8,}" title="Password must be at least 8 characters, including uppercase, lowercase, number, and special character">
+                        <span class="inline-error" id="signupPasswordError">Password must be at least 8 characters, including uppercase, lowercase, number, and special character</span>
+                    </div>
+                    <div class="form-group">
+                        <label for="confirmPassword">Confirm Password:</label>
+                        <input type="password" id="confirmPassword" name="confirm_password" required aria-describedby="confirmPasswordError">
+                        <span class="inline-error" id="confirmPasswordError">Passwords do not match</span>
+                    </div>
+                    <div class="form-group">
+                        <label for="signupAge">Age:</label>
+                        <input type="number" id="signupAge" name="age" min="18" max="100" required aria-describedby="signupAgeError">
+                        <span class="inline-error" id="signupAgeError">Age must be between 18 and 100</span>
+                    </div>
+                    <div class="form-group">
+                        <label for="occupation">Occupation:</label>
+                        <input type="text" id="occupation" name="occupation" required aria-describedby="occupationError" maxlength="100">
+                        <span class="inline-error" id="occupationError">Occupation is required</span>
+                    </div>
                     <div class="step-buttons">
-                        <button type="button" disabled>Previous</button>
                         <button type="button" onclick="nextStep(2)">Next</button>
                     </div>
                 </div>
                 <!-- Step 2 -->
                 <div class="step" id="step2" style="display:none;">
                     <h3>Contact Information</h3>
-                    <label for="phone">Phone Number:</label>
-                    <input type="text" id="phone" name="phone" required aria-describedby="phoneError" pattern="0[0-9]{9}" title="Phone number must be 10 digits starting with 0 (e.g., 0885620896)">
-                    <span class="inline-error" id="phoneError">Phone number must be 10 digits starting with 0 (e.g., 0885620896).</span>
-                    <label for="gender">Gender:</label>
-                    <select id="gender" name="gender" required aria-describedby="genderError">
-                        <option value="">Select Gender</option>
-                        <option value="Male">Male</option>
-                        <option value="Female">Female</option>
-                        <option value="Other">Other</option>
-                    </select>
-                    <span class="inline-error" id="genderError">Please select a gender.</span>
-                    <label for="address">Address:</label>
-                    <input type="text" id="address" name="address" required aria-describedby="addressError" maxlength="255">
-                    <span class="inline-error" id="addressError">Address is required.</span>
-                    <label for="location">Location:</label>
-                    <select id="location" name="location" required aria-describedby="locationError">
-                        <option value="">Select Location</option>
-                        <option value="Lilongwe">Lilongwe</option>
-                        <option value="Blantyre">Blantyre</option>
-                        <option value="Mzuzu">Mzuzu</option>
-                        <option value="Zomba">Zomba</option>
-                    </select>
-                    <span class="inline-error" id="locationError">Please select a location.</span>
+                    <div class="form-group">
+                        <label for="phone">Phone Number:</label>
+                        <input type="text" id="phone" name="phone" required aria-describedby="phoneError" pattern="0[0-9]{9}" title="Phone number must be 10 digits starting with 0 (e.g., 0885620896)">
+                        <span class="inline-error" id="phoneError">Phone number must be 10 digits starting with 0 (e.g., 0885620896)</span>
+                    </div>
+                    <div class="form-group">
+                        <label for="gender">Gender:</label>
+                        <select id="gender" name="gender" required aria-describedby="genderError">
+                            <option value="">Select Gender</option>
+                            <option value="Male">Male</option>
+                            <option value="Female">Female</option>
+                            <option value="Other">Other</option>
+                        </select>
+                        <span class="inline-error" id="genderError">Please select a gender</span>
+                    </div>
+                    <div class="form-group">
+                        <label for="address">Address:</label>
+                        <input type="text" id="address" name="address" required aria-describedby="addressError" maxlength="255">
+                        <span class="inline-error" id="addressError">Address is required</span>
+                    </div>
+                    <div class="form-group">
+                        <label for="location">Location:</label>
+                        <select id="location" name="location" required aria-describedby="locationError">
+                            <option value="">Select Location</option>
+                            <option value="Lilongwe">Lilongwe</option>
+                            <option value="Blantyre">Blantyre</option>
+                            <option value="Mzuzu">Mzuzu</option>
+                            <option value="Zomba">Zomba</option>
+                        </select>
+                        <span class="inline-error" id="locationError">Please select a location</span>
+                    </div>
                     <div class="step-buttons">
                         <button type="button" onclick="prevStep(1)">Previous</button>
                         <button type="button" onclick="nextStep(3)">Next</button>
@@ -1174,22 +1089,28 @@ $js_temp_booking_data = json_encode($temp_booking_data);
                 <!-- Step 3 -->
                 <div class="step" id="step3" style="display:none;">
                     <h3>Next of Kin</h3>
-                    <label for="kin_name">Full Name:</label>
-                    <input type="text" id="kin_name" name="kin_name" required aria-describedby="kinNameError" maxlength="100">
-                    <span class="inline-error" id="kinNameError">Full name is required.</span>
-                    <label for="kin_relationship">Relationship:</label>
-                    <select id="kin_relationship" name="kin_relationship" required aria-describedby="kinRelationshipError">
-                        <option value="">Select Relationship</option>
-                        <option value="Parent">Parent</option>
-                        <option value="Sibling">Sibling</option>
-                        <option value="Spouse">Spouse</option>
-                        <option value="Friend">Friend</option>
-                        <option value="Other">Other</option>
-                    </select>
-                    <span class="inline-error" id="kinRelationshipError">Please select a relationship.</span>
-                    <label for="kin_phone">Phone Number:</label>
-                    <input type="text" id="kin_phone" name="kin_phone" required aria-describedby="kinPhoneError" pattern="0[0-9]{9}" title="Phone number must be 10 digits starting with 0 (e.g., 0885620896)">
-                    <span class="inline-error" id="kinPhoneError">Phone number must be 10 digits starting with 0 (e.g., 0885620896).</span>
+                    <div class="form-group">
+                        <label for="kin_name">Full Name:</label>
+                        <input type="text" id="kin_name" name="kin_name" required aria-describedby="kinNameError" maxlength="100">
+                        <span class="inline-error" id="kinNameError">Full name is required</span>
+                    </div>
+                    <div class="form-group">
+                        <label for="kin_relationship">Relationship:</label>
+                        <select id="kin_relationship" name="kin_relationship" required aria-describedby="kinRelationshipError">
+                            <option value="">Select Relationship</option>
+                            <option value="Parent">Parent</option>
+                            <option value="Sibling">Sibling</option>
+                            <option value="Spouse">Spouse</option>
+                            <option value="Friend">Friend</option>
+                            <option value="Other">Other</option>
+                        </select>
+                        <span class="inline-error" id="kinRelationshipError">Please select a relationship</span>
+                    </div>
+                    <div class="form-group">
+                        <label for="kin_phone">Phone Number:</label>
+                        <input type="text" id="kin_phone" name="kin_phone" required aria-describedby="kinPhoneError" pattern="0[0-9]{9}" title="Phone number must be 10 digits starting with 0 (e.g., 0885620896)">
+                        <span class="inline-error" id="kinPhoneError">Phone number must be 10 digits starting with 0 (e.g., 0885620896)</span>
+                    </div>
                     <div class="step-buttons">
                         <button type="button" onclick="prevStep(2)">Previous</button>
                         <button type="button" onclick="nextStep(4)">Next</button>
@@ -1198,13 +1119,17 @@ $js_temp_booking_data = json_encode($temp_booking_data);
                 <!-- Step 4 -->
                 <div class="step" id="step4" style="display:none;">
                     <h3>Documents</h3>
-                    <label for="national_id">National ID (PDF):</label>
-                    <input type="file" id="national_id" name="national_id" accept="application/pdf" required aria-describedby="nationalIdError">
-                    <span class="inline-error" id="nationalIdError">A valid PDF document (max 2MB) is required.</span>
-                    <label for="profile_picture">Profile Picture (JPEG/PNG):</label>
-                    <input type="file" id="profile_picture" name="profile_picture" accept="image/jpeg,image/png" required aria-describedby="profilePictureError">
-                    <span class="inline-error" id="profilePictureError">A valid image (JPEG/PNG, max 2MB) is required.</span>
-                    <img id="profilePicturePreview" class="profile-picture-preview" alt="Profile Picture Preview">
+                    <div class="form-group">
+                        <label for="national_id">National ID (PDF):</label>
+                        <input type="file" id="national_id" name="national_id" accept="application/pdf" required aria-describedby="nationalIdError">
+                        <span class="inline-error" id="nationalIdError">Please upload a PDF file under 2MB</span>
+                    </div>
+                    <div class="form-group">
+                        <label for="profile_picture">Profile Picture (JPEG/PNG):</label>
+                        <input type="file" id="profile_picture" name="profile_picture" accept="image/jpeg,image/png" required aria-describedby="profilePictureError">
+                        <span class="inline-error" id="profilePictureError">Please upload a JPEG or PNG image under 2MB</span>
+                        <img id="profilePicturePreview" class="profile-picture-preview" alt="Profile Picture Preview">
+                    </div>
                     <div class="step-buttons">
                         <button type="button" onclick="prevStep(3)">Previous</button>
                         <button type="submit" name="signup">Sign Up</button>
@@ -1212,8 +1137,74 @@ $js_temp_booking_data = json_encode($temp_booking_data);
                 </div>
             </form>
             <div class="form-links">
-                <a href="#" id="showLogin">Already have an account? Login</a>
+                <a href="#" id="showLoginFromSignup">Already have an account? Login</a>
             </div>
+        </div>
+    </div>
+
+    <!-- Forgot Password Modal -->
+    <div id="forgotPasswordModal" class="modal">
+        <div class="modal-content">
+            <span class="close" data-target="forgotPasswordModal">×</span>
+            <h2>Forgot Password</h2>
+            <form id="forgotPasswordForm" method="POST">
+                <input type="hidden" name="csrf_token" value="<?php echo htmlspecialchars($_SESSION['csrf_token']); ?>">
+                <label for="forgot_email">Email:</label>
+                <input type="email" id="forgot_email" name="forgot_email" required aria-describedby="forgotEmailError">
+                <span class="inline-error" id="forgotEmailError">Please enter a valid email address</span>
+                <button type="submit" name="forgot_password">Reset Password</button>
+            </form>
+            <div class="form-links">
+                <a href="#" id="showLoginFromForgot">Back to Login</a>
+            </div>
+        </div>
+    </div>
+
+    <!-- Booking Modal -->
+    <div id="bookingModal" class="modal">
+        <div class="modal-content">
+            <span class="close" data-target="bookingModal">×</span>
+            <h2>Book a Car</h2>
+            <form id="bookingForm" method="POST">
+                <input type="hidden" name="csrf_token" value="<?php echo htmlspecialchars($_SESSION['csrf_token']); ?>">
+                <input type="hidden" id="modalCarId" name="car_id">
+                <label for="modalCarName">Car Name:</label>
+                <input type="text" id="modalCarName" readonly>
+                <label for="modalPricePerDay">Price per Day (Kwacha):</label>
+                <input type="text" id="modalPricePerDay" name="price_per_day" readonly>
+                <label for="modalPickUpDate">Pick-up Date:</label>
+                <input type="date" id="modalPickUpDate" name="pick_up_date" required aria-describedby="modalPickUpDateError">
+                <span class="inline-error" id="modalPickUpDateError">Pick-up date must be today or later</span>
+                <label for="modalReturnDate">Return Date:</label>
+                <input type="date" id="modalReturnDate" name="return_date" required aria-describedby="modalReturnDateError">
+                <span class="inline-error" id="modalReturnDateError">Return date must be after pick-up date</span>
+                <label for="modalTotalCost">Total Cost:</label>
+                <input type="text" id="modalTotalCost" readonly>
+                <button type="submit" name="book">Confirm Booking</button>
+            </form>
+        </div>
+    </div>
+
+    <!-- Payment Modal -->
+    <div id="paymentModal" class="modal">
+        <div class="modal-content">
+            <span class="close" data-target="paymentModal">×</span>
+            <h2>Payment</h2>
+            <div id="paymentDetails"></div>
+            <label for="paymentPhone">Phone Number:</label>
+            <input type="text" id="paymentPhone" placeholder="e.g., 0885620896" required aria-describedby="paymentPhoneError">
+            <span class="inline-error" id="paymentPhoneError">Phone number must be 10 digits starting with 0</span>
+            <button onclick="processPayment()">Process Payment</button>
+        </div>
+    </div>
+
+    <!-- Payment Failure Modal -->
+    <div id="paymentFailureModal" class="modal">
+        <div class="modal-content">
+            <span class="close" data-target="paymentFailureModal">×</span>
+            <h2>Payment Failed</h2>
+            <p id="paymentFailureMessage"></p>
+            <button onclick="hideModal('paymentFailureModal')">Close</button>
         </div>
     </div>
 
@@ -1224,239 +1215,205 @@ $js_temp_booking_data = json_encode($temp_booking_data);
             <h2>Edit Profile</h2>
             <form id="editProfileForm" method="POST">
                 <input type="hidden" name="csrf_token" value="<?php echo htmlspecialchars($_SESSION['csrf_token']); ?>">
+                <label for="edit_first_name">First Name:</label>
+                <input type="text" id="edit_first_name" name="edit_first_name" value="<?php echo htmlspecialchars($user['first_name'] ?? ''); ?>" required aria-describedby="editFirstNameError" minlength="2" maxlength="50" pattern="[A-Za-z]+" title="First name can only contain letters">
+                <span class="inline-error" id="editFirstNameError">First name must be 2-50 letters only</span>
+                <label for="edit_last_name">Last Name:</label>
+                <input type="text" id="edit_last_name" name="edit_last_name" value="<?php echo htmlspecialchars($user['last_name'] ?? ''); ?>" required aria-describedby="editLastNameError" minlength="2" maxlength="50" pattern="[A-Za-z]+" title="Last name can only contain letters">
+                <span class="inline-error" id="editLastNameError">Last name must be 2-50 letters only</span>
                 <label for="edit_username">Username:</label>
-                <input type="text" id="edit_username" name="edit_username" value="<?php echo htmlspecialchars($user['username'] ?? ''); ?>" required aria-describedby="editUsernameError" minlength="3" maxlength="50" pattern="[A-Za-z0-9_]+">
-                <span class="inline-error" id="editUsernameError">Username must be 3-50 characters, using letters, numbers, or underscores.</span>
+                <input type="text" id="edit_username" name="edit_username" value="<?php echo htmlspecialchars($user['username'] ?? ''); ?>" required aria-describedby="editUsernameError" minlength="3" maxlength="50" pattern="[A-Za-z0-9_]+" title="Username can only contain letters, numbers, and underscores">
+                <span class="inline-error" id="editUsernameError">Username must be 3-50 characters (letters, numbers, or underscores)</span>
                 <label for="edit_email">Email:</label>
                 <input type="email" id="edit_email" name="edit_email" value="<?php echo htmlspecialchars($user['email'] ?? ''); ?>" required aria-describedby="editEmailError">
-                <span class="inline-error" id="editEmailError">Valid email required.</span>
-                <label for="edit_phone">Phone:</label>
-                <input type="text" id="edit_phone" name="edit_phone" value="<?php echo htmlspecialchars($user['phone'] ?? ''); ?>" required aria-describedby="editPhoneError" pattern="0[0-9]{9}">
-                <span class="inline-error" id="editPhoneError">Phone number                must be 10 digits starting with 0 (e.g., 0885620896).</span>
+                <span class="inline-error" id="editEmailError">Please enter a valid email address</span>
+                <label for="edit_phone">Phone Number:</label>
+                <input type="text" id="edit_phone" name="edit_phone" value="<?php echo htmlspecialchars($user['phone'] ?? ''); ?>" required aria-describedby="editPhoneError" pattern="0[0-9]{9}" title="Phone number must be 10 digits starting with 0 (e.g., 0885620896)">
+                <span class="inline-error" id="editPhoneError">Phone number must be 10 digits starting with 0</span>
                 <label for="edit_gender">Gender:</label>
                 <select id="edit_gender" name="edit_gender" required aria-describedby="editGenderError">
+                    <option value="">Select Gender</option>
                     <option value="Male" <?php echo ($user['gender'] ?? '') == 'Male' ? 'selected' : ''; ?>>Male</option>
                     <option value="Female" <?php echo ($user['gender'] ?? '') == 'Female' ? 'selected' : ''; ?>>Female</option>
                     <option value="Other" <?php echo ($user['gender'] ?? '') == 'Other' ? 'selected' : ''; ?>>Other</option>
                 </select>
-                <span class="inline-error" id="editGenderError">Please select a gender.</span>
-                <label for="edit_age">Age:</label>
-                <input type="number" id="edit_age" name="edit_age" value="<?php echo htmlspecialchars($user['age'] ?? ''); ?>" min="18" max="100" required aria-describedby="editAgeError">
-                <span class="inline-error" id="editAgeError">Age must be between 18 and 100.</span>
+                <span class="inline-error" id="editGenderError">Please select a gender</span>
                 <label for="edit_address">Address:</label>
-                <input type="text" id="edit_address" name="edit_address" value="<?php echo htmlspecialchars($user['address'] ?? ''); ?>" required aria-describedby="editAddressError">
-                <span class="inline-error" id="editAddressError">Address is required.</span>
+                <input type="text" id="edit_address" name="edit_address" value="<?php echo htmlspecialchars($user['address'] ?? ''); ?>" required aria-describedby="editAddressError" maxlength="255">
+                <span class="inline-error" id="editAddressError">Address is required</span>
                 <label for="edit_location">Location:</label>
                 <select id="edit_location" name="edit_location" required aria-describedby="editLocationError">
+                    <option value="">Select Location</option>
                     <option value="Lilongwe" <?php echo ($user['location'] ?? '') == 'Lilongwe' ? 'selected' : ''; ?>>Lilongwe</option>
                     <option value="Blantyre" <?php echo ($user['location'] ?? '') == 'Blantyre' ? 'selected' : ''; ?>>Blantyre</option>
                     <option value="Mzuzu" <?php echo ($user['location'] ?? '') == 'Mzuzu' ? 'selected' : ''; ?>>Mzuzu</option>
                     <option value="Zomba" <?php echo ($user['location'] ?? '') == 'Zomba' ? 'selected' : ''; ?>>Zomba</option>
                 </select>
-                <span class="inline-error" id="editLocationError">Please select a location.</span>
+                <span class="inline-error" id="editLocationError">Please select a location</span>
+                <label for="edit_age">Age:</label>
+                <input type="number" id="edit_age" name="edit_age" value="<?php echo htmlspecialchars($user['age'] ?? ''); ?>" min="18" max="100" required aria-describedby="editAgeError">
+                <span class="inline-error" id="editAgeError">Age must be between 18 and 100</span>
+                <label for="edit_occupation">Occupation:</label>
+                <input type="text" id="edit_occupation" name="edit_occupation" value="<?php echo htmlspecialchars($user['occupation'] ?? ''); ?>" required aria-describedby="editOccupationError" maxlength="100">
+                <span class="inline-error" id="editOccupationError">Occupation is required</span>
                 <button type="submit" name="update_profile">Update Profile</button>
             </form>
         </div>
     </div>
 
     <footer>
-        <p>© <?php echo date('Y'); ?> MIBESA Car Rental. All rights reserved.</p>
+        <p>&copy; <?php echo date('Y'); ?> MIBESA Car Rental. All rights reserved.</p>
         <div class="social-icons">
-            <a href="#" aria-label="Facebook"><i class="fab fa-facebook-f"></i></a>
-            <a href="#" aria-label="Twitter"><i class="fab fa-twitter"></i></a>
-            <a href="#" aria-label="Instagram"><i class="fab fa-instagram"></i></a>
-            <a href="#" aria-label="LinkedIn"><i class="fab fa-linkedin-in"></i></a>
+            <a href="#"><i class="fab fa-facebook-f"></i></a>
+            <a href="#"><i class="fab fa-twitter"></i></a>
+            <a href="#"><i class="fab fa-instagram"></i></a>
         </div>
     </footer>
     <script>
-  // Current date from PHP for date validation
-const currentDate = '<?php echo $current_date; ?>';
+     const currentDate = '<?php echo $current_date; ?>';
+let currentStep = 1;
+let paymentError = <?php echo $js_payment_error; ?>;
+let paymentType = <?php echo $js_payment_type; ?>;
+let tempSignupData = <?php echo $js_temp_signup_data; ?>;
+let tempBookingData = <?php echo $js_temp_booking_data; ?>;
 
-// Payment error handling variables from PHP
-const paymentError = <?php echo $js_payment_error; ?>;
-const paymentType = <?php echo $js_payment_type; ?>;
-const tempSignupData = <?php echo $js_temp_signup_data; ?>;
-const tempBookingData = <?php echo $js_temp_booking_data; ?>;
+// Initialize modals
+const modals = document.querySelectorAll('.modal');
+const closeButtons = document.querySelectorAll('.close');
+const loginBtn = document.getElementById('loginBtn');
+const showSignup = document.getElementById('showSignup');
+const showLoginFromSignup = document.getElementById('showLoginFromSignup');
+const showForgotPassword = document.getElementById('showForgotPassword');
+const showLoginFromForgot = document.getElementById('showLoginFromForgot');
 
-// Handle payment failure and page load initialization
-window.addEventListener('load', () => {
-    // Show section based on URL parameter
-    const urlParams = new URLSearchParams(window.location.search);
-    const section = urlParams.get('section') || 'home';
-    showSection(section);
-
-    // Handle payment error if present
-    if (paymentError) {
-        // Display error message
-        const alertDiv = document.createElement('div');
-        alertDiv.className = 'alert';
-        alertDiv.textContent = paymentError;
-        document.body.insertBefore(alertDiv, document.querySelector('section'));
-
-        // Handle signup payment failure
-        if (paymentType === 'signup' && tempSignupData) {
-            // Populate signup form with temp data
-            document.getElementById('signupUsername').value = tempSignupData.username || '';
-            document.getElementById('signupEmail').value = tempSignupData.email || '';
-            document.getElementById('signupAge').value = tempSignupData.age || '';
-            document.getElementById('phone').value = tempSignupData.phone || '';
-            document.getElementById('gender').value = tempSignupData.gender || '';
-            document.getElementById('address').value = tempSignupData.address || '';
-            document.getElementById('location').value = tempSignupData.location || '';
-            document.getElementById('kin_name').value = tempSignupData.kin_name || '';
-            document.getElementById('kin_relationship').value = tempSignupData.kin_relationship || '';
-            document.getElementById('kin_phone').value = tempSignupData.kin_phone || '';
-
-            // Reset to step 1
-            document.querySelectorAll('.step').forEach(s => s.style.display = 'none');
-            document.getElementById('step1').style.display = 'block';
-            document.querySelectorAll('.progress-step').forEach(p => p.classList.remove('active'));
-            document.getElementById('progress1').classList.add('active');
-
-            // Clear file inputs (security restrictions prevent pre-filling)
-            document.getElementById('national_id').value = '';
-            document.getElementById('profile_picture').value = '';
-            document.getElementById('profilePicturePreview').style.display = 'none';
-
-            // Show signup modal
-            document.getElementById('signupModal').style.display = 'block';
-        } 
-        // Handle booking payment failure
-        else if (paymentType === 'booking' && tempBookingData) {
-            // Show booking section and populate form
-            showSection('booking');
-            const select = document.getElementById('bookingCarId');
-            for (let option of select.options) {
-                if (option.value == tempBookingData.car_id) {
-                    option.selected = true;
-                    break;
-                }
-            }
-            updatePricePerDay();
-            document.getElementById('pick_up_date').value = tempBookingData.pick_up_date || '';
-            document.getElementById('return_date').value = tempBookingData.return_date || '';
-            calculateTotalCost(
-                tempBookingData.pick_up_date,
-                tempBookingData.return_date,
-                parseFloat(tempBookingData.price_per_day)
-            );
-        }
-
-        // Auto-remove alert after 5 seconds
-        setTimeout(() => {
-            alertDiv.remove();
-        }, 5000);
-    }
-});
-
-// Show specific section and hide others
+// Show section
 function showSection(sectionId) {
-    document.querySelectorAll('section').forEach(section => {
-        section.style.display = 'none';
-    });
+    document.querySelectorAll('section').forEach(section => section.style.display = 'none');
     document.getElementById(sectionId).style.display = 'block';
-    // Update URL without page reload
-    history.pushState(null, '', `?section=${sectionId}`);
+    window.scrollTo({ top: 0, behavior: 'smooth' });
+    if (sectionId === 'cars') {
+        initializeSlider();
+    }
 }
 
-// Modal close button handling
-document.querySelectorAll('.close').forEach(closeBtn => {
-    closeBtn.addEventListener('click', () => {
-        const modalId = closeBtn.getAttribute('data-target');
-        document.getElementById(modalId).style.display = 'none';
+// Modal handling
+function showModal(modalId) {
+    modals.forEach(modal => modal.style.display = 'none');
+    document.getElementById(modalId).style.display = 'block';
+}
+
+function hideModal(modalId) {
+    document.getElementById(modalId).style.display = 'none';
+}
+
+closeButtons.forEach(button => {
+    button.addEventListener('click', () => {
+        hideModal(button.dataset.target);
     });
 });
 
-// Login and Signup modal toggling
-document.getElementById('loginBtn')?.addEventListener('click', () => {
-    document.getElementById('loginModal').style.display = 'block';
-    document.getElementById('signupModal').style.display = 'none';
+window.addEventListener('click', (event) => {
+    modals.forEach(modal => {
+        if (event.target === modal) {
+            modal.style.display = 'none';
+        }
+    });
 });
 
-document.getElementById('showSignup')?.addEventListener('click', () => {
-    document.getElementById('signupModal').style.display = 'block';
-    document.getElementById('loginModal').style.display = 'none';
-});
+if (loginBtn) {
+    loginBtn.addEventListener('click', () => showModal('loginModal'));
+}
 
-document.getElementById('showLogin')?.addEventListener('click', () => {
-    document.getElementById('loginModal').style.display = 'block';
-    document.getElementById('signupModal').style.display = 'none';
-});
+if (showSignup) {
+    showSignup.addEventListener('click', () => {
+        hideModal('loginModal');
+        showModal('signupModal');
+    });
+}
 
-// Signup Form Step Navigation
+if (showLoginFromSignup) {
+    showLoginFromSignup.addEventListener('click', () => {
+        hideModal('signupModal');
+        showModal('loginModal');
+    });
+}
+
+if (showForgotPassword) {
+    showForgotPassword.addEventListener('click', () => {
+        hideModal('loginModal');
+        showModal('forgotPasswordModal');
+    });
+}
+
+if (showLoginFromForgot) {
+    showLoginFromForgot.addEventListener('click', () => {
+        hideModal('forgotPasswordModal');
+        showModal('loginModal');
+    });
+}
+
+// Signup steps
 function nextStep(step) {
-    if (validateStep(step - 1)) {
-        document.querySelectorAll('.step').forEach(s => s.style.display = 'none');
+    if (validateStep(currentStep)) {
+        document.getElementById(`step${currentStep}`).style.display = 'none';
         document.getElementById(`step${step}`).style.display = 'block';
-        document.querySelectorAll('.progress-step').forEach(p => p.classList.remove('active'));
+        document.getElementById(`progress${currentStep}`).classList.remove('active');
         document.getElementById(`progress${step}`).classList.add('active');
+        currentStep = step;
     }
 }
 
 function prevStep(step) {
-    document.querySelectorAll('.step').forEach(s => s.style.display = 'none');
+    document.getElementById(`step${currentStep}`).style.display = 'none';
     document.getElementById(`step${step}`).style.display = 'block';
-    document.querySelectorAll('.progress-step').forEach(p => p.classList.remove('active'));
+    document.getElementById(`progress${currentStep}`).classList.remove('active');
     document.getElementById(`progress${step}`).classList.add('active');
+    currentStep = step;
 }
 
-// Form Validation Utilities
-function showError(elementId, message) {
-    const errorElement = document.getElementById(elementId);
-    errorElement.textContent = message;
-    errorElement.style.display = 'block';
-    errorElement.setAttribute('aria-live', 'polite');
-}
-
-function hideError(elementId) {
-    const errorElement = document.getElementById(elementId);
-    errorElement.style.display = 'none';
-}
-
-// Validate Signup Form Steps
+// Client-side validation for signup steps
 function validateStep(step) {
-    let valid = true;
+    let isValid = true;
+    const showError = (id, message) => {
+        const errorElement = document.getElementById(id);
+        errorElement.textContent = message;
+        errorElement.style.display = 'block';
+        isValid = false;
+    };
 
     if (step === 1) {
+        const firstName = document.getElementById('first_name').value;
+        const lastName = document.getElementById('last_name').value;
         const username = document.getElementById('signupUsername').value;
         const email = document.getElementById('signupEmail').value;
         const password = document.getElementById('signupPassword').value;
         const confirmPassword = document.getElementById('confirmPassword').value;
         const age = document.getElementById('signupAge').value;
+        const occupation = document.getElementById('occupation').value;
 
-        if (!username || !/^[A-Za-z0-9_]{3,50}$/.test(username)) {
-            showError('signupUsernameError', 'Username must be 3-50 characters, using letters, numbers, or underscores.');
-            valid = false;
-        } else {
-            hideError('signupUsernameError');
+        if (!/^[A-Za-z]{2,50}$/.test(firstName)) {
+            showError('firstNameError', 'First name must be 2-50 letters only');
         }
-
-        if (!email || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
-            showError('signupEmailError', 'Valid email required.');
-            valid = false;
-        } else {
-            hideError('signupEmailError');
+        if (!/^[A-Za-z]{2,50}$/.test(lastName)) {
+            showError('lastNameError', 'Last name must be 2-50 letters only');
         }
-
-        if (!password || password.length < 8) {
-            showError('signupPasswordError', 'Password must be at least 8 characters.');
-            valid = false;
-        } else {
-            hideError('signupPasswordError');
+        if (!/^[A-Za-z0-9_]{3,50}$/.test(username)) {
+            showError('signupUsernameError', 'Username must be 3-50 characters (letters, numbers, or underscores)');
         }
-
+        if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+            showError('signupEmailError', 'Please enter a valid email address');
+        }
+        if (!/^(?=.*[a-z])(?=.*[A-Z])(?=.*\d)(?=.*[@$!%*?&])[A-Za-z\d@$!%*?&]{8,}$/.test(password)) {
+            showError('signupPasswordError', 'Password must be at least 8 characters, including uppercase, lowercase, number, and special character');
+        }
         if (password !== confirmPassword) {
-            showError('confirmPasswordError', 'Passwords do not match.');
-            valid = false;
-        } else {
-            hideError('confirmPasswordError');
+            showError('confirmPasswordError', 'Passwords do not match');
         }
-
-        if (!age || age < 18 || age > 100) {
-            showError('signupAgeError', 'Age must be between 18 and 100.');
-            valid = false;
-        } else {
-            hideError('signupAgeError');
+        if (age < 18 || age > 100) {
+            showError('signupAgeError', 'Age must be between 18 and 100');
+        }
+        if (!occupation) {
+            showError('occupationError', 'Occupation is required');
         }
     } else if (step === 2) {
         const phone = document.getElementById('phone').value;
@@ -1464,32 +1421,17 @@ function validateStep(step) {
         const address = document.getElementById('address').value;
         const location = document.getElementById('location').value;
 
-        if (!phone || !/^0[0-9]{9}$/.test(phone)) {
-            showError('phoneError', 'Phone number must be 10 digits starting with 0 (e.g., 0885620896).');
-            valid = false;
-        } else {
-            hideError('phoneError');
+        if (!/^0[0-9]{9}$/.test(phone)) {
+            showError('phoneError', 'Phone number must be 10 digits starting with 0');
         }
-
-        if (!gender) {
-            showError('genderError', 'Please select a gender.');
-            valid = false;
-        } else {
-            hideError('genderError');
+        if (!['Male', 'Female', 'Other'].includes(gender)) {
+            showError('genderError', 'Please select a gender');
         }
-
         if (!address) {
-            showError('addressError', 'Address is required.');
-            valid = false;
-        } else {
-            hideError('addressError');
+            showError('addressError', 'Address is required');
         }
-
-        if (!location) {
-            showError('locationError', 'Please select a location.');
-            valid = false;
-        } else {
-            hideError('locationError');
+        if (!['Lilongwe', 'Blantyre', 'Mzuzu', 'Zomba'].includes(location)) {
+            showError('locationError', 'Please select a location');
         }
     } else if (step === 3) {
         const kinName = document.getElementById('kin_name').value;
@@ -1497,62 +1439,36 @@ function validateStep(step) {
         const kinPhone = document.getElementById('kin_phone').value;
 
         if (!kinName) {
-            showError('kinNameError', 'Full name is required.');
-            valid = false;
-        } else {
-            hideError('kinNameError');
+            showError('kinNameError', 'Full name is required');
         }
-
-        if (!kinRelationship) {
-            showError('kinRelationshipError', 'Please select a relationship.');
-            valid = false;
-        } else {
-            hideError('kinRelationshipError');
+        if (!['Parent', 'Sibling', 'Spouse', 'Friend', 'Other'].includes(kinRelationship)) {
+            showError('kinRelationshipError', 'Please select a relationship');
         }
-
-        if (!kinPhone || !/^0[0-9]{9}$/.test(kinPhone)) {
-            showError('kinPhoneError', 'Phone number must be 10 digits starting with 0 (e.g., 0885620896).');
-            valid = false;
-        } else {
-            hideError('kinPhoneError');
+        if (!/^0[0-9]{9}$/.test(kinPhone)) {
+            showError('kinPhoneError', 'Phone number must be 10 digits starting with 0');
         }
     } else if (step === 4) {
         const nationalId = document.getElementById('national_id').files[0];
         const profilePicture = document.getElementById('profile_picture').files[0];
 
         if (!nationalId || nationalId.type !== 'application/pdf' || nationalId.size > 2 * 1024 * 1024) {
-            showError('nationalIdError', 'A valid PDF document (max 2MB) is required.');
-            valid = false;
-        } else {
-            hideError('nationalIdError');
+            showError('nationalIdError', 'Please upload a PDF file under 2MB');
         }
-
         if (!profilePicture || !['image/jpeg', 'image/png'].includes(profilePicture.type) || profilePicture.size > 2 * 1024 * 1024) {
-            showError('profilePictureError', 'A valid image (JPEG/PNG, max 2MB) is required.');
-            valid = false;
-        } else {
-            hideError('profilePictureError');
+            showError('profilePictureError', 'Please upload a JPEG or PNG image under 2MB');
         }
     }
 
-    return valid;
+    return isValid;
 }
 
-// Real-time validation for signup form
-document.getElementById('signupForm')?.querySelectorAll('input, select').forEach(input => {
-    input.addEventListener('input', () => {
-        const step = parseInt(input.closest('.step').id.replace('step', ''));
-        validateStep(step);
-    });
-});
-
 // Profile picture preview
-document.getElementById('profile_picture')?.addEventListener('change', function(e) {
-    const file = e.target.files[0];
+document.getElementById('profile_picture').addEventListener('change', function (event) {
+    const file = event.target.files[0];
     const preview = document.getElementById('profilePicturePreview');
     if (file && ['image/jpeg', 'image/png'].includes(file.type)) {
         const reader = new FileReader();
-        reader.onload = function(e) {
+        reader.onload = function (e) {
             preview.src = e.target.result;
             preview.style.display = 'block';
         };
@@ -1562,184 +1478,431 @@ document.getElementById('profile_picture')?.addEventListener('change', function(
     }
 });
 
-// Booking Form Handling
-function updatePricePerDay() {
-    const select = document.getElementById('bookingCarId');
-    const carNameInput = document.getElementById('carName');
-    const priceInput = document.getElementById('pricePerDay');
-    const totalCostInput = document.getElementById('totalCost');
-    const pickUpDate = document.getElementById('pick_up_date').value;
-    const returnDate = document.getElementById('return_date').value;
+/// Initialize slider
+function initializeSlider() {
+    const slides = document.querySelector('.slides');
+    const slideElements = document.querySelectorAll('.slide');
+    const totalSlides = slideElements.length;
 
-    const selectedOption = select.options[select.selectedIndex];
-    if (selectedOption.value) {
-        carNameInput.value = selectedOption.getAttribute('data-name');
-        priceInput.value = selectedOption.getAttribute('data-price');
-        calculateTotalCost(pickUpDate, returnDate, parseFloat(priceInput.value));
-    } else {
-        carNameInput.value = '';
-        priceInput.value = '';
-        totalCostInput.value = '';
+    // Set slides container width based on number of slides
+    slides.style.width = `${100 * totalSlides}%`;
+
+    // Set each slide to occupy full viewport width
+    slideElements.forEach(slide => {
+        slide.style.width = `${100 / totalSlides}%`;
+    });
+
+    let currentIndex = 0;
+
+    function showSlide(index) {
+        slides.style.transform = `translateX(-${index * (100 / totalSlides)}%)`;
     }
+
+    function nextSlide() {
+        currentIndex++;
+        if (currentIndex >= totalSlides) {
+            currentIndex = 0;
+            slides.style.transition = 'none';
+            showSlide(currentIndex);
+            setTimeout(() => {
+                slides.style.transition = 'transform 0.5s ease';
+            }, 100);
+        } else {
+            slides.style.transition = 'transform 0.5s ease';
+            showSlide(currentIndex);
+        }
+    }
+
+    // Show the first slide
+    showSlide(currentIndex);
+
+    // Auto-slide every 10 seconds
+    setInterval(nextSlide, 10000);
 }
 
-function calculateTotalCost(pickUpDate, returnDate, pricePerDay) {
-    if (pickUpDate && returnDate && pricePerDay) {
+document.addEventListener('DOMContentLoaded', initializeSlider);
+
+// Show booking modal
+function showBookingModal(carId, carName, pricePerDay) {
+    document.getElementById('modalCarId').value = carId;
+    document.getElementById('modalCarName').value = carName;
+    document.getElementById('modalPricePerDay').value = pricePerDay;
+    document.getElementById('modalPickUpDate').setAttribute('min', currentDate);
+    showModal('bookingModal');
+    calculateTotalCost();
+}
+
+// Calculate total cost for booking
+function calculateTotalCost() {
+    const pickUpDate = document.getElementById('modalPickUpDate').value;
+    const returnDate = document.getElementById('modalReturnDate').value;
+    const pricePerDay = parseFloat(document.getElementById('modalPricePerDay').value);
+
+    if (pickUpDate && returnDate) {
         const pickUp = new Date(pickUpDate);
         const returnD = new Date(returnDate);
-        const diffTime = returnD - pickUp;
+        const diffTime = Math.abs(returnD - pickUp);
         const diffDays = Math.ceil(diffTime / (1000 * 60 * 60 * 24));
+
         if (diffDays > 0) {
             const totalCost = diffDays * pricePerDay;
-            document.getElementById('totalCost').value = totalCost.toFixed(2) + ' Kwacha';
+            document.getElementById('modalTotalCost').value = totalCost.toFixed(2) + ' Kwacha';
         } else {
-            document.getElementById('totalCost').value = '';
+            document.getElementById('modalTotalCost').value = 'Invalid dates';
         }
     }
 }
 
-// Validate Booking Form
-document.getElementById('newBookingForm')?.addEventListener('submit', function(e) {
-    const carId = document.getElementById('bookingCarId').value;
+// Update price per day for new booking form
+function updatePricePerDay() {
+    const select = document.getElementById('bookingCarId');
+    const selectedOption = select.options[select.selectedIndex];
+    const carName = selectedOption.dataset.name;
+    const price = selectedOption.dataset.price;
+
+    document.getElementById('carName').value = carName || '';
+    document.getElementById('pricePerDay').value = price || '';
+    calculateNewBookingTotalCost();
+}
+
+// Calculate total cost for new booking form
+function calculateNewBookingTotalCost() {
     const pickUpDate = document.getElementById('pick_up_date').value;
     const returnDate = document.getElementById('return_date').value;
-    let valid = true;
+    const pricePerDay = parseFloat(document.getElementById('pricePerDay').value);
 
-    if (!carId) {
-        showError('bookingCarIdError', 'Please select a car.');
-        valid = false;
-    } else {
-        hideError('bookingCarIdError');
+    if (pickUpDate && returnDate && !isNaN(pricePerDay)) {
+        const pickUp = new Date(pickUpDate);
+        const returnD = new Date(returnDate);
+        const diffTime = Math.abs(returnD - pickUp);
+        const diffDays = Math.ceil(diffTime / (1000 * 60 * 60 * 24));
+
+        if (diffDays > 0) {
+            const totalCost = diffDays * pricePerDay;
+            document.getElementById('totalCost').value = totalCost.toFixed(2) + ' Kwacha';
+        } else {
+            document.getElementById('totalCost').value = 'Invalid dates';
+        }
     }
+}
 
-    if (!pickUpDate || new Date(pickUpDate) < new Date(currentDate)) {
-        showError('pickUpDateError', 'Pick-up date must be today or later.');
-        valid = false;
-    } else {
-        hideError('pickUpDateError');
-    }
+// Event listeners for date inputs
+document.getElementById('modalPickUpDate').addEventListener('change', calculateTotalCost);
+document.getElementById('modalReturnDate').addEventListener('change', calculateTotalCost);
+document.getElementById('pick_up_date').addEventListener('change', calculateNewBookingTotalCost);
+document.getElementById('return_date').addEventListener('change', calculateNewBookingTotalCost);
 
-    if (!returnDate || new Date(returnDate) <= new Date(pickUpDate)) {
-        showError('returnDateError', 'Return date must be after pick-up date.');
-        valid = false;
-    } else {
-        hideError('returnDateError');
-    }
+// Show edit profile modal
+function showEditProfileModal() {
+    showModal('editProfileModal');
+}
 
-    if (!valid) {
-        e.preventDefault();
-    }
-});
-
-// Update total cost on date changes
-document.getElementById('pick_up_date')?.addEventListener('change', updatePricePerDay);
-document.getElementById('return_date')?.addEventListener('change', updatePricePerDay);
-
-// Contact Form Validation
-document.getElementById('contactForm')?.addEventListener('submit', function(e) {
-    const email = document.getElementById('contact_email').value;
-    const message = document.getElementById('contact_message').value;
-    let valid = true;
-
-    if (!email || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
-        showError('emailError', 'Valid email required.');
-        valid = false;
-    } else {
-        hideError('emailError');
-    }
-
-    if (!message) {
-        showError('messageError', 'Message is required.');
-        valid = false;
-    } else {
-        hideError('messageError');
-    }
-
-    if (!valid) {
-        e.preventDefault();
-    }
-});
-
-// Filter Bookings in Bookings Section
+// Filter bookings
 function filterBookings() {
     const search = document.getElementById('bookingSearch').value.toLowerCase();
-    const status = document.getElementById('bookingStatusFilter').value.toLowerCase();
+    const status = document.getElementById('bookingStatusFilter').value;
     const rows = document.querySelectorAll('#bookingsTable tbody tr');
 
     rows.forEach(row => {
-        const car = row.cells[0].textContent.toLowerCase();
+        const carName = row.cells[0].textContent.toLowerCase();
         const bookingId = row.cells[1].textContent.toLowerCase();
         const rowStatus = row.cells[4].textContent.toLowerCase();
 
-        const matchesSearch = car.includes(search) || bookingId.includes(search);
-        const matchesStatus = !status || rowStatus === status;
+        const matchesSearch = carName.includes(search) || bookingId.includes(search);
+        const matchesStatus = !status || rowStatus === status.toLowerCase();
 
         row.style.display = matchesSearch && matchesStatus ? '' : 'none';
     });
 }
 
+// Reset booking filter
 function resetBookingFilter() {
     document.getElementById('bookingSearch').value = '';
     document.getElementById('bookingStatusFilter').value = '';
     filterBookings();
 }
 
-// Filter Bookings in Profile Section
+// Filter profile bookings
 function filterProfileBookings() {
     const search = document.getElementById('profileBookingSearch').value.toLowerCase();
-    const status = document.getElementById('profileBookingStatusFilter').value.toLowerCase();
+    const status = document.getElementById('profileBookingStatusFilter').value;
     const rows = document.querySelectorAll('#profileBookingsTable tbody tr');
 
     rows.forEach(row => {
-        const car = row.cells[0].textContent.toLowerCase();
+        const carName = row.cells[0].textContent.toLowerCase();
         const rowStatus = row.cells[3].textContent.toLowerCase();
 
-        const matchesSearch = car.includes(search);
-        const matchesStatus = !status || rowStatus === status;
+        const matchesSearch = carName.includes(search);
+        const matchesStatus = !status || rowStatus === status.toLowerCase();
 
         row.style.display = matchesSearch && matchesStatus ? '' : 'none';
     });
 }
 
+// Reset profile booking filter
 function resetProfileBookingFilter() {
     document.getElementById('profileBookingSearch').value = '';
     document.getElementById('profileBookingStatusFilter').value = '';
     filterProfileBookings();
 }
 
-// Show Edit Profile Modal
-function showEditProfileModal() {
-    document.getElementById('editProfileModal').style.display = 'block';
+// Show payment failure modal
+function showPaymentFailureModal(type) {
+    const message = type === 'signup' 
+        ? 'Signup failed due to payment processing error. Please try signing up again.'
+        : 'Booking failed due to payment processing error. Please try booking again.';
+    document.getElementById('paymentFailureMessage').textContent = message;
+    showModal('paymentFailureModal');
 }
 
-// Show Booking Modal from Car Card
-function showBookingModal(carId, carName, pricePerDay) {
-    showSection('booking');
-    const select = document.getElementById('bookingCarId');
-    for (let option of select.options) {
-        if (option.value == carId) {
-            option.selected = true;
-            break;
-        }
+// Handle payment modal
+if (paymentError && paymentType) {
+    let details = '';
+    if (paymentType === 'signup' && tempSignupData) {
+        details = `<p>Amount: 500 Kwacha</p><p>Purpose: Account Signup</p>`;
+        document.getElementById('paymentPhone').value = tempSignupData.phone || '';
+        showModal('paymentModal');
+    } else if (paymentType === 'booking' && tempBookingData) {
+        details = `<p>Car: ${tempBookingData.car_name}</p><p>Amount: ${tempBookingData.total_cost} Kwacha</p><p>Booking ID: ${tempBookingData.booking_id}</p>`;
+        showModal('paymentModal');
     }
-    updatePricePerDay();
+    document.getElementById('paymentDetails').innerHTML = details;
+    // Show failure modal if payment error exists
+    showPaymentFailureModal(paymentType);
 }
 
-// Slider Functionality
-let slideIndex = 0;
-function showSlides() {
-    const slides = document.querySelector('.slides');
-    const totalSlides = document.querySelectorAll('.slide').length;
-    slideIndex = (slideIndex >= totalSlides) ? 0 : slideIndex < 0 ? totalSlides - 1 : slideIndex;
-    slides.style.transform = `translateX(-${slideIndex * 100}%)`;
-    setTimeout(() => {
-        slideIndex++;
-        showSlides();
-    }, 5000);
+// Process payment (placeholder)
+function processPayment() {
+    const phone = document.getElementById('paymentPhone').value;
+    if (!/^0[0-9]{9}$/.test(phone)) {
+        document.getElementById('paymentPhoneError').style.display = 'block';
+        return;
+    }
+    // Simulate payment processing
+    alert('Payment processing not implemented in this demo.');
+    hideModal('paymentModal');
 }
 
-// Initialize slider
-showSlides();
-</script>
-</body>
-</html>
+// Form validation for login
+document.getElementById('loginForm').addEventListener('submit', function (event) {
+    let isValid = true;
+    const email = document.getElementById('loginEmail').value;
+    const password = document.getElementById('loginPassword').value;
+
+    document.getElementById('loginEmailError').style.display = 'none';
+    document.getElementById('loginPasswordError').style.display = 'none';
+
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+        document.getElementById('loginEmailError').style.display = 'block';
+        isValid = false;
+    }
+    if (!password) {
+        document.getElementById('loginPasswordError').style.display = 'block';
+        isValid = false;
+    }
+
+    if (!isValid) {
+        event.preventDefault();
+    }
+});
+
+// Form validation for forgot password
+document.getElementById('forgotPasswordForm').addEventListener('submit', function (event) {
+    const email = document.getElementById('forgot_email').value;
+    document.getElementById('forgotEmailError').style.display = 'none';
+
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+        document.getElementById('forgotEmailError').style.display = 'block';
+        event.preventDefault();
+    }
+});
+
+// Form validation for contact
+document.getElementById('contactForm').addEventListener('submit', function (event) {
+    let isValid = true;
+    const email = document.getElementById('contact_email').value;
+    const message = document.getElementById('contact_message').value;
+
+    document.getElementById('emailError').style.display = 'none';
+    document.getElementById('messageError').style.display = 'none';
+
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+        document.getElementById('emailError').style.display = 'block';
+        isValid = false;
+    }
+    if (!message.trim()) {
+        document.getElementById('messageError').style.display = 'block';
+        isValid = false;
+    }
+
+    if (!isValid) {
+        event.preventDefault();
+    }
+});
+
+// Form validation for booking form
+document.getElementById('bookingForm').addEventListener('submit', function (event) {
+    let isValid = true;
+    const pickUpDate = document.getElementById('modalPickUpDate').value;
+    const returnDate = document.getElementById('modalReturnDate').value;
+    const today = new Date(currentDate);
+    const pickUp = new Date(pickUpDate);
+    const returnD = new Date(returnDate);
+
+    document.getElementById('modalPickUpDateError').style.display = 'none';
+    document.getElementById('modalReturnDateError').style.display = 'none';
+
+    if (!pickUpDate || pickUp < today.setHours(0, 0, 0, 0)) {
+        document.getElementById('modalPickUpDateError').style.display = 'block';
+        isValid = false;
+    }
+    if (!returnDate || returnD <= pickUp) {
+        document.getElementById('modalReturnDateError').style.display = 'block';
+        isValid = false;
+    }
+
+    if (!isValid) {
+        event.preventDefault();
+    }
+});
+
+// Form validation for new booking form
+document.getElementById('newBookingForm').addEventListener('submit', function (event) {
+    let isValid = true;
+    const carId = document.getElementById('bookingCarId').value;
+    const pickUpDate = document.getElementById('pick_up_date').value;
+    const returnDate = document.getElementById('return_date').value;
+    const today = new Date(currentDate);
+    const pickUp = new Date(pickUpDate);
+    const returnD = new Date(returnDate);
+
+    document.getElementById('bookingCarIdError').style.display = 'none';
+    document.getElementById('pickUpDateError').style.display = 'none';
+    document.getElementById('returnDateError').style.display = 'none';
+
+    if (!carId) {
+        document.getElementById('bookingCarIdError').style.display = 'block';
+        isValid = false;
+    }
+    if (!pickUpDate || pickUp < today.setHours(0, 0, 0, 0)) {
+        document.getElementById('pickUpDateError').style.display = 'block';
+        isValid = false;
+    }
+    if (!returnDate || returnD <= pickUp) {
+        document.getElementById('returnDateError').style.display = 'block';
+        isValid = false;
+    }
+
+    if (!isValid) {
+        event.preventDefault();
+    }
+});
+
+// Form validation for edit profile
+document.getElementById('editProfileForm').addEventListener('submit', function (event) {
+    let isValid = true;
+    const firstName = document.getElementById('edit_first_name').value;
+    const lastName = document.getElementById('edit_last_name').value;
+    const username = document.getElementById('edit_username').value;
+    const email = document.getElementById('edit_email').value;
+    const phone = document.getElementById('edit_phone').value;
+    const gender = document.getElementById('edit_gender').value;
+    const address = document.getElementById('edit_address').value;
+    const location = document.getElementById('edit_location').value;
+    const age = document.getElementById('edit_age').value;
+    const occupation = document.getElementById('edit_occupation').value;
+
+    document.querySelectorAll('#editProfileForm .inline-error').forEach(error => error.style.display = 'none');
+
+    if (!/^[A-Za-z]{2,50}$/.test(firstName)) {
+        document.getElementById('editFirstNameError').style.display = 'block';
+        isValid = false;
+    }
+    if (!/^[A-Za-z]{2,50}$/.test(lastName)) {
+        document.getElementById('editLastNameError').style.display = 'block';
+        isValid = false;
+    }
+    if (!/^[A-Za-z0-9_]{3,50}$/.test(username)) {
+        document.getElementById('editUsernameError').style.display = 'block';
+        isValid = false;
+    }
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+        document.getElementById('editEmailError').style.display = 'block';
+        isValid = false;
+    }
+    if (!/^0[0-9]{9}$/.test(phone)) {
+        document.getElementById('editPhoneError').style.display = 'block';
+        isValid = false;
+    }
+    if (!['Male', 'Female', 'Other'].includes(gender)) {
+        document.getElementById('editGenderError').style.display = 'block';
+        isValid = false;
+    }
+    if (!address) {
+        document.getElementById('editAddressError').style.display = 'block';
+        isValid = false;
+    }
+    if (!['Lilongwe', 'Blantyre', 'Mzuzu', 'Zomba'].includes(location)) {
+        document.getElementById('editLocationError').style.display = 'block';
+        isValid = false;
+    }
+    if (age < 18 || age > 100) {
+        document.getElementById('editAgeError').style.display = 'block';
+        isValid = false;
+    }
+    if (!occupation) {
+        document.getElementById('editOccupationError').style.display = 'block';
+        isValid = false;
+    }
+
+    if (!isValid) {
+        event.preventDefault();
+    }
+});
+
+// Clear inline errors on input
+document.querySelectorAll('input, select, textarea').forEach(input => {
+    input.addEventListener('input', function () {
+        const errorId = this.getAttribute('aria-describedby');
+        if (errorId) {
+            document.getElementById(errorId).style.display = 'none';
+        }
+    });
+});
+
+// Initialize page
+document.addEventListener('DOMContentLoaded', function () {
+    showSection('home');
+    initializeSlider();
+
+    // Populate signup form with temp data if available
+    if (tempSignupData) {
+        document.getElementById('first_name').value = tempSignupData.first_name || '';
+        document.getElementById('last_name').value = tempSignupData.last_name || '';
+        document.getElementById('signupUsername').value = tempSignupData.username || '';
+        document.getElementById('signupEmail').value = tempSignupData.email || '';
+        document.getElementById('phone').value = tempSignupData.phone || '';
+        document.getElementById('gender').value = tempSignupData.gender || '';
+        document.getElementById('address').value = tempSignupData.address || '';
+        document.getElementById('location').value = tempSignupData.location || '';
+        document.getElementById('kin_name').value = tempSignupData.kin_name || '';
+        document.getElementById('kin_relationship').value = tempSignupData.kin_relationship || '';
+        document.getElementById('kin_phone').value = tempSignupData.kin_phone || '';
+        document.getElementById('signupAge').value = tempSignupData.age || '';
+        document.getElementById('occupation').value = tempSignupData.occupation || '';
+    }
+});
+    </script>
+                 
+    </body>
+    </html>
+    <?php
+// Clean up any remaining session data if necessary
+if (isset($_SESSION['temp_signup_data']) && !isset($payment_error)) {
+    unset($_SESSION['temp_signup_data']);
+}
+if (isset($_SESSION['temp_booking_data']) && !isset($payment_error)) {
+    unset($_SESSION['temp_booking_data']);
+}
+?>
+    

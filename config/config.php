@@ -8,7 +8,7 @@ if (session_status() === PHP_SESSION_NONE) {
 if (empty($_SESSION['csrf_token'])) {
     $_SESSION['csrf_token'] = bin2hex(random_bytes(32));
 }
-
+/*
 // Validate CSRF token
 function validateCsrfToken($token) {
     if (!isset($_SESSION['csrf_token']) || empty($token) || !hash_equals($_SESSION['csrf_token'], $token)) {
@@ -17,7 +17,7 @@ function validateCsrfToken($token) {
     // Regenerate CSRF token after successful validation
     $_SESSION['csrf_token'] = bin2hex(random_bytes(32));
     return true;
-}
+}*/
 
 // Database connection
 $host = 'localhost';
@@ -70,7 +70,7 @@ define('PAYCHANGU_PUBLIC_KEY', 'PUB-UX2TGIXxxTqeHRKHZ8sg8s3djpHwwuhT');
 define('PAYCHANGU_SECRET_KEY', 'SEC-9PWNq4Ncx2uRK3m13VSgpxY8Af5bRsFV');
 define('PAYCHANGU_API_URL', 'https://api.paychangu.com'); // Live mode
 // define('PAYCHANGU_API_URL', 'https://api.sandbox.paychangu.com'); // Test mode
-define('PAYCHANGU_MOBILE_MONEY_REF_ID', '20be6c20-adeb-4b5b-a7ba-0769820df4fb');
+define('PAYCHANGU_MOBILE_MONEY_REF_ID', '27494cb5-ba9e-437f-a114-4e7a7686bcca');
 
 // Include payment functions
 require 'payment_functions.php';
