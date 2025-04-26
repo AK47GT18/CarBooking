@@ -780,7 +780,7 @@ $js_temp_booking_data = json_encode($temp_booking_data);
     <section id="home">
         <div class="slider">
             <div class="slides">
-                <div class="slide"><img src="https://via.placeholder.com/1200x600?text=Car+1" alt="Car 1"></div>
+                <div class="slide"><img src="" alt="Car 1"></div>
                 <div class="slide"><img src="https://via.placeholder.com/1200x600?text=Car+2" alt="Car 2"></div>
                 <div class="slide"><img src="https://via.placeholder.com/1200x600?text=Car+3" alt="Car 3"></div>
                 <div class="slide"><img src="https://via.placeholder.com/1200x600?text=Car+4" alt="Car 4"></div>
