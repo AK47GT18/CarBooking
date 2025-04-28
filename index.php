@@ -1,8 +1,37 @@
 <?php
 require 'config.php';
+ob_start();
 
 use GuzzleHttp\Client;
 use GuzzleHttp\Exception\RequestException;
+
+// Database reconnection functions
+function getPDOConnection($host, $dbname, $username, $password) {
+    try {
+        $pdo = new PDO("mysql:host=$host;dbname=$dbname", $username, $password);
+        $pdo->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
+        $pdo->setAttribute(PDO::ATTR_DEFAULT_FETCH_MODE, PDO::FETCH_ASSOC);
+        return $pdo;
+    } catch (PDOException $e) {
+        error_log("Connection failed: " . $e->getMessage());
+        throw $e;
+    }
+}
+
+function ensurePDOConnection($pdo, $host, $dbname, $username, $password) {
+    try {
+        $pdo->query("SELECT 1");
+        return $pdo;
+    } catch (PDOException $e) {
+        error_log("Reconnecting to database due to: " . $e->getMessage());
+        return getPDOConnection($host, $dbname, $username, $password);
+    }
+}
+
+// CSRF token validation function
+function validateCsrfToken($token) {
+    return isset($_SESSION['csrf_token']) && hash_equals($_SESSION['csrf_token'], $token);
+}
 
 // Start session
 if (session_status() === PHP_SESSION_NONE) {
@@ -23,6 +52,7 @@ $temp_booking_data = null;
 
 // Check if user is logged in
 if (isset($_SESSION['user_id'])) {
+    $pdo = ensurePDOConnection($pdo, $host, $dbname, $username, $password);
     $stmt = $pdo->prepare("SELECT * FROM users WHERE id = ?");
     $stmt->execute([$_SESSION['user_id']]);
     $user = $stmt->fetch();
@@ -47,6 +77,7 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_POST['login'])) {
             $error = "Password cannot be empty";
         } else {
             try {
+                $pdo = ensurePDOConnection($pdo, $host, $dbname, $username, $password);
                 $stmt = $pdo->prepare("SELECT * FROM users WHERE email = ?");
                 $stmt->execute([$email]);
                 $user = $stmt->fetch();
@@ -105,13 +136,13 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_POST['signup'])) {
         } elseif (!filter_var($email, FILTER_VALIDATE_EMAIL)) {
             $error = "Please enter a valid email address";
         } else {
-            // Check if email already exists
+            $pdo = ensurePDOConnection($pdo, $host, $dbname, $username, $password);
             $stmt = $pdo->prepare("SELECT COUNT(*) FROM users WHERE email = ?");
             $stmt->execute([$email]);
             if ($stmt->fetchColumn() > 0) {
                 $error = "This email is already registered. Please use a different email or log in.";
-            } elseif (!preg_match('/^0[0-9]{9}$/', $phone)) {
-                $error = "Phone number must be 10 digits starting with 0 (e.g., 0823456789)";
+            } elseif (!preg_match('/^0[89][0-9]{8}$/', $phone)) {
+                $error = "Phone number must be 10 digits starting with 08 or 09 (e.g., 0885620896 or 0999123456)";
             } elseif (!preg_match('/^(?=.*[a-z])(?=.*[A-Z])(?=.*\d)(?=.*[@$!%*?&])[A-Za-z\d@$!%*?&]{8,}$/', $password)) {
                 $error = "Password must be at least 8 characters, including uppercase, lowercase, number, and special character";
             } elseif ($password !== $confirm_password) {
@@ -126,8 +157,8 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_POST['signup'])) {
                 $error = "Next of kin name is required";
             } elseif (!in_array($kin_relationship, ['Parent', 'Sibling', 'Spouse', 'Friend', 'Other'])) {
                 $error = "Please select a valid relationship";
-            } elseif (!preg_match('/^0[0-9]{9}$/', $kin_phone)) {
-                $error = "Next of kin phone must be 10 digits starting with 0 (e.g., 0885620896)";
+            } elseif (!preg_match('/^0[89][0-9]{8}$/', $kin_phone)) {
+                $error = "Next of kin phone must be 10 digits starting with 08 or 09 (e.g., 0885620896 or 0999123456)";
             } elseif ($age < 18 || $age > 100) {
                 $error = "Age must be between 18 and 100";
             } elseif (empty($occupation)) {
@@ -183,6 +214,7 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_POST['signup'])) {
                         @unlink($profile_picture_path);
                     } else {
                         $user_id = $payment['user_id'];
+                        $pdo = ensurePDOConnection($pdo, $host, $dbname, $username, $password);
                         $adminStmt = $pdo->query("SELECT email FROM admins");
                         while ($admin = $adminStmt->fetch()) {
                             sendEmail($admin['email'], "New User Signup and Payment", "A new user ($username, $email) has paid the 500 Kwacha registration fee and signed up (charge_id: {$payment['charge_id']}). Please review and approve their account.");
@@ -210,6 +242,7 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_POST['forgot_password'])) {
             $error = "Please enter a valid email address";
         } else {
             try {
+                $pdo = ensurePDOConnection($pdo, $host, $dbname, $username, $password);
                 $stmt = $pdo->prepare("SELECT * FROM users WHERE email = ?");
                 $stmt->execute([$email]);
                 $user = $stmt->fetch();
@@ -277,6 +310,7 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_POST['book'])) {
                 'price_per_day' => $price_per_day
             ];
 
+            $pdo = ensurePDOConnection($pdo, $host, $dbname, $username, $password);
             $stmt = $pdo->prepare("SELECT name FROM cars WHERE id = ?");
             $stmt->execute([$car_id]);
             $car = $stmt->fetch();
@@ -289,7 +323,7 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_POST['book'])) {
                 $temp_booking_data = $_SESSION['temp_booking_data'];
                 unset($_SESSION['temp_booking_data']);
             } else {
-                // Update car booking count
+                $pdo = ensurePDOConnection($pdo, $host, $dbname, $username, $password);
                 $stmt = $pdo->prepare("UPDATE cars SET booking_count = booking_count + 1 WHERE id = ?");
                 $stmt->execute([$car_id]);
                 unset($_SESSION['temp_booking_data']);
@@ -328,13 +362,13 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_POST['update_profile'])) {
         } elseif (!filter_var($email, FILTER_VALIDATE_EMAIL)) {
             $error = "Please enter a valid email address";
         } else {
-            // Check if email is already used by another user
+            $pdo = ensurePDOConnection($pdo, $host, $dbname, $username, $password);
             $stmt = $pdo->prepare("SELECT COUNT(*) FROM users WHERE email = ? AND id != ?");
             $stmt->execute([$email, $_SESSION['user_id']]);
             if ($stmt->fetchColumn() > 0) {
                 $error = "This email is already registered. Please use a different email.";
-            } elseif (!preg_match('/^0[0-9]{9}$/', $phone)) {
-                $error = "Phone number must be 10 digits starting with 0 (e.g., 0885620896)";
+            } elseif (!preg_match('/^0[89][0-9]{8}$/', $phone)) {
+                $error = "Phone number must be 10 digits starting with 08 or 09 (e.g., 0885620896 or 0999123456)";
             } elseif (!in_array($gender, ['Male', 'Female', 'Other'])) {
                 $error = "Please select a valid gender";
             } elseif (empty($address)) {
@@ -347,6 +381,7 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_POST['update_profile'])) {
                 $error = "Occupation is required";
             } else {
                 try {
+                    $pdo = ensurePDOConnection($pdo, $host, $dbname, $username, $password);
                     $stmt = $pdo->prepare("UPDATE users SET first_name = ?, last_name = ?, username = ?, email = ?, phone = ?, gender = ?, address = ?, location = ?, age = ?, occupation = ? WHERE id = ?");
                     $stmt->execute([$first_name, $last_name, $username, $email, $phone, $gender, $address, $location, $age, $occupation, $_SESSION['user_id']]);
                     header("Location: index.php?message=Profile updated successfully");
@@ -373,6 +408,7 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_POST['contact'])) {
         } elseif (empty($message)) {
             $error = "Message cannot be empty";
         } else {
+            $pdo = ensurePDOConnection($pdo, $host, $dbname, $username, $password);
             $adminStmt = $pdo->query("SELECT email FROM admins");
             $success = true;
             while ($admin = $adminStmt->fetch()) {
@@ -408,6 +444,7 @@ if ($filter_fuel && in_array($filter_fuel, ['Petrol', 'Diesel', 'Electric'])) {
 }
 
 try {
+    $pdo = ensurePDOConnection($pdo, $host, $dbname, $username, $password);
     $carsStmt = $pdo->prepare($cars_query);
     $carsStmt->execute($params);
     $cars = $carsStmt->fetchAll();
@@ -417,10 +454,12 @@ try {
 }
 
 // Fetch featured cars (only available)
+$pdo = ensurePDOConnection($pdo, $host, $dbname, $username, $password);
 $featuredCarsStmt = $pdo->query("SELECT * FROM cars WHERE featured = 1 AND status = 'available' LIMIT 3");
 $featuredCars = $featuredCarsStmt->fetchAll();
 
 // Fetch available cars
+$pdo = ensurePDOConnection($pdo, $host, $dbname, $username, $password);
 $availableCarsStmt = $pdo->query("SELECT * FROM cars WHERE status = 'available'");
 $availableCars = $availableCarsStmt->fetchAll();
 
@@ -429,6 +468,7 @@ $js_payment_error = json_encode($payment_error);
 $js_payment_type = json_encode($payment_type);
 $js_temp_signup_data = json_encode($temp_signup_data);
 $js_temp_booking_data = json_encode($temp_booking_data);
+ob_end_flush();
 ?>
 <!DOCTYPE html>
 <html lang="en">
@@ -450,53 +490,47 @@ $js_temp_booking_data = json_encode($temp_booking_data);
         .profile-icon { font-size: 1.2rem; margin-right: 0.5rem; }
         .username { color: #fff; font-size: 1rem; }
         .slider {
-    position: relative;
-    overflow: hidden;
-    height: 70vh; /* Increased from 60vh to make the slider taller */
-}
-
-.slides {
-    height: 100%;
-    display: flex;
-    transition: transform 0.5s ease;
-}
-
-.slide {
-    width: 100%;
-    height: 100%;
-    position: relative;
-}
-
-.slide img {
-    width: 100%;
-    height: 100%;
-    object-fit: cover;
-    border: 8px solid #fff;
-    border-radius: 12px;
-    box-shadow: 0 4px 20px rgba(0,0,0,0.2);
-    margin: 10px;
-}
-
-.slider-text {
-    position: absolute;
-    top: 50%;
-    left: 50%;
-    transform: translate(-50%, -50%);
-    text-align: center;
-    color: #fff;
-    background: rgba(0, 0, 0, 0.6); /* Added semi-transparent black background */
-    padding: 20px 40px; /* Added padding for better appearance */
-    border-radius: 10px; /* Rounded corners for the background */
-}
-
-.slider-text h2 {
-    font-size: 2.5rem;
-    margin-bottom: 1rem;
-}
-
-.slider-text p {
-    font-size: 1.2rem;
-}
+            position: relative;
+            overflow: hidden;
+            height: 70vh;
+        }
+        .slides {
+            height: 100%;
+            display: flex;
+            transition: transform 0.5s ease;
+        }
+        .slide {
+            width: 100%;
+            height: 100%;
+            position: relative;
+        }
+        .slide img {
+            width: 100%;
+            height: 100%;
+            object-fit: cover;
+            border: 8px solid #fff;
+            border-radius: 12px;
+            box-shadow: 0 4px 20px rgba(0,0,0,0.2);
+            margin: 10px;
+        }
+        .slider-text {
+            position: absolute;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            text-align: center;
+            color: #fff;
+            background: rgba(0, 0, 0, 0.6);
+            padding: 20px 40px;
+            border-radius: 10px;
+        }
+        .slider-text h2 {
+            font-size: 2.5rem;
+            margin-bottom: 1rem;
+        }
+        .slider-text p {
+            font-size: 1.2rem;
+        }
         .modal { display: none; position: fixed; z-index: 1000; left: 0; top: 0; width: 100%; height: 100%; background-color: rgba(0,0,0,0.6); }
         .modal-content { position: fixed; top: 50%; left: 50%; transform: translate(-50%, -50%); background: white; padding: 2rem; border-radius: 12px; box-shadow: 0 4px 20px rgba(0,0,0,0.15); width: 600px; max-width: 95%; max-height: 90vh; overflow-y: auto; }
         .close { position: absolute; right: 20px; top: 10px; color: #aaa; font-size: 24px; font-weight: bold; cursor: pointer; }
@@ -530,8 +564,6 @@ $js_temp_booking_data = json_encode($temp_booking_data);
         .form-section { margin-bottom: 20px; border-bottom: 1px solid #eee; padding-bottom: 20px; }
         input[type="file"] { background: #f8f9fa; padding: 12px; border-radius: 8px; border: 1px dashed #ccc; width: 100%; }
         form input:hover, form select:hover, form textarea:hover { border-color: #66fcf1; }
-
-        /* Cars Section Styles */
         .slider-container { overflow-x: auto; white-space: nowrap; background: #0b0c10; padding: 1rem 0; }
         .slider-container img { width: 280px; height: 160px; margin: 0 10px; border-radius: 10px; display: inline-block; object-fit: cover; }
         .section-header { padding: 2rem; font-size: 1.6rem; color: #0b0c10; text-align: center; }
@@ -553,14 +585,10 @@ $js_temp_booking_data = json_encode($temp_booking_data);
         .car-card button:hover { background: #0b0c10; color: #66fcf1; }
         .car-card button:disabled { background: #ccc; cursor: not-allowed; }
         .car-card .signup-info { margin: 0.5rem 1rem 1rem; color: #721c24; font-size: 0.8rem; font-style: italic; text-align: center; }
-
-        /* Home Section Styles */
         .home-content { text-align: center; }
         .home-content p { font-size: 1.1rem; line-height: 1.6; color: #555; margin-bottom: 20px; }
         .home-content .cta-button { display: inline-block; background: #0b0c10; color: white; padding: 12px 24px; border-radius: 8px; text-decoration: none; font-weight: bold; transition: background 0.3s ease, color 0.3s ease; }
         .home-content .cta-button:hover { background: #66fcf1; color: #0b0c10; }
-
-        /* Signup Modal Styles */
         #signupModal .modal-content { background: #ffffff; border: 2px solid #0b0c10; border-radius: 15px; padding: 2.5rem; width: 600px; max-width: 95%; }
         #signupModal h2 { color: #0b0c10; font-size: 1.8rem; margin-bottom: 1.5rem; text-align: center; }
         #signupModal h3 { color: #45a29e; font-size: 1.2rem; margin-bottom: 1rem; border-top: none; }
@@ -579,8 +607,6 @@ $js_temp_booking_data = json_encode($temp_booking_data);
         #signupModal .form-links a { color: #45a29e; }
         #signupModal .form-links a:hover { color: #66fcf1; }
         #signupModal .profile-picture-preview { margin: 10px 0; max-width: 100px; max-height: 100px; border-radius: 8px; display: none; }
-
-        /* Profile and Bookings Styles */
         .profile-content, .bookings-content, .booking-content { padding: 40px; max-width: 1200px; margin: 0 auto; }
         .profile-header { display: flex; align-items: center; margin-bottom: 20px; }
         .profile-pic { width: 100px; height: 100px; border-radius: 50%; object-fit: cover; margin-right: 20px; }
@@ -596,8 +622,6 @@ $js_temp_booking_data = json_encode($temp_booking_data);
         .edit-profile-btn:hover, .new-booking-btn:hover { background: #66fcf1; color: #0b0c10; }
         .booking-form { background: white; padding: 20px; border-radius: 12px; box-shadow: 0 4px 20px rgba(0,0,0,0.05); margin-bottom: 2rem; }
         .booking-form h3 { color: #45a29e; margin-bottom: 1rem; }
-
-        /* Responsive Design */
         @media (max-width: 992px) {
             .grid-container { grid-template-columns: repeat(2, 1fr); gap: 1rem; }
             .car-card { max-width: 100%; }
@@ -810,6 +834,7 @@ $js_temp_booking_data = json_encode($temp_booking_data);
                 <tbody>
                     <?php
                     if (isset($_SESSION['user_id'])) {
+                        $pdo = ensurePDOConnection($pdo, $host, $dbname, $username, $password);
                         $stmt = $pdo->prepare("SELECT b.*, c.name AS car_name FROM bookings b LEFT JOIN cars c ON b.car_id = c.id WHERE b.user_id = ? ORDER BY b.created_at DESC");
                         $stmt->execute([$_SESSION['user_id']]);
                         $bookings = $stmt->fetchAll();
@@ -944,6 +969,7 @@ $js_temp_booking_data = json_encode($temp_booking_data);
                 <tbody>
                     <?php
                     if (isset($_SESSION['user_id'])) {
+                        $pdo = ensurePDOConnection($pdo, $host, $dbname, $username, $password);
                         $stmt = $pdo->prepare("SELECT b.*, c.name AS car_name FROM bookings b LEFT JOIN cars c ON b.car_id = c.id WHERE b.user_id = ? ORDER BY b.created_at DESC");
                         $stmt->execute([$_SESSION['user_id']]);
                         $bookings = $stmt->fetchAll();
@@ -1052,8 +1078,8 @@ $js_temp_booking_data = json_encode($temp_booking_data);
                     <h3>Contact Information</h3>
                     <div class="form-group">
                         <label for="phone">Phone Number:</label>
-                        <input type="text" id="phone" name="phone" required aria-describedby="phoneError" pattern="0[0-9]{9}" title="Phone number must be 10 digits starting with 0 (e.g., 0885620896)">
-                        <span class="inline-error" id="phoneError">Phone number must be 10 digits starting with 0 (e.g., 0885620896)</span>
+                        <input type="text" id="phone" name="phone" required aria-describedby="phoneError" pattern="0[89][0-9]{8}" title="Phone number must be 10 digits starting with 08 or 09 (e.g., 0885620896 or 0999123456)">
+                        <span class="inline-error" id="phoneError">Phone number must be 10 digits starting with 08 or 09 (e.g., 0885620896 or 0999123456)</span>
                     </div>
                     <div class="form-group">
                         <label for="gender">Gender:</label>
@@ -1108,8 +1134,8 @@ $js_temp_booking_data = json_encode($temp_booking_data);
                     </div>
                     <div class="form-group">
                         <label for="kin_phone">Phone Number:</label>
-                        <input type="text" id="kin_phone" name="kin_phone" required aria-describedby="kinPhoneError" pattern="0[0-9]{9}" title="Phone number must be 10 digits starting with 0 (e.g., 0885620896)">
-                        <span class="inline-error" id="kinPhoneError">Phone number must be 10 digits starting with 0 (e.g., 0885620896)</span>
+                        <input type="text" id="kin_phone" name="kin_phone" required aria-describedby="kinPhoneError" pattern="0[89][0-9]{8}" title="Phone number must be 10 digits starting with 08 or 09 (e.g., 0885620896 or 0999123456)">
+                        <span class="inline-error" id="kinPhoneError">Phone number must be 10 digits starting with 08 or 09 (e.g., 0885620896 or 0999123456)</span>
                     </div>
                     <div class="step-buttons">
                         <button type="button" onclick="prevStep(2)">Previous</button>
@@ -1192,8 +1218,8 @@ $js_temp_booking_data = json_encode($temp_booking_data);
             <h2>Payment</h2>
             <div id="paymentDetails"></div>
             <label for="paymentPhone">Phone Number:</label>
-            <input type="text" id="paymentPhone" placeholder="e.g., 0885620896" required aria-describedby="paymentPhoneError">
-            <span class="inline-error" id="paymentPhoneError">Phone number must be 10 digits starting with 0</span>
+            <input type="text" id="paymentPhone" placeholder="e.g., 0885620896 or 0999123456" required aria-describedby="paymentPhoneError">
+            <span class="inline-error" id="paymentPhoneError">Phone number must be 10 digits starting with 08 or 09</span>
             <button onclick="processPayment()">Process Payment</button>
         </div>
     </div>
@@ -1228,8 +1254,8 @@ $js_temp_booking_data = json_encode($temp_booking_data);
                 <input type="email" id="edit_email" name="edit_email" value="<?php echo htmlspecialchars($user['email'] ?? ''); ?>" required aria-describedby="editEmailError">
                 <span class="inline-error" id="editEmailError">Please enter a valid email address</span>
                 <label for="edit_phone">Phone Number:</label>
-                <input type="text" id="edit_phone" name="edit_phone" value="<?php echo htmlspecialchars($user['phone'] ?? ''); ?>" required aria-describedby="editPhoneError" pattern="0[0-9]{9}" title="Phone number must be 10 digits starting with 0 (e.g., 0885620896)">
-                <span class="inline-error" id="editPhoneError">Phone number must be 10 digits starting with 0</span>
+                <input type="text" id="edit_phone" name="edit_phone" value="<?php echo htmlspecialchars($user['phone'] ?? ''); ?>" required aria-describedby="editPhoneError" pattern="0[89][0-9]{8}" title="Phone number must be 10 digits starting with 08 or 09 (e.g., 0885620896 or 0999123456)">
+                <span class="inline-error" id="editPhoneError">Phone number must be 10 digits starting with 08 or 09</span>
                 <label for="edit_gender">Gender:</label>
                 <select id="edit_gender" name="edit_gender" required aria-describedby="editGenderError">
                     <option value="">Select Gender</option>
@@ -1262,7 +1288,7 @@ $js_temp_booking_data = json_encode($temp_booking_data);
     </div>
 
     <footer>
-        <p>&copy; <?php echo date('Y'); ?> MIBESA Car Rental. All rights reserved.</p>
+        <p>© <?php echo date('Y'); ?> MIBESA Car Rental. All rights reserved.</p>
         <div class="social-icons">
             <a href="#"><i class="fab fa-facebook-f"></i></a>
             <a href="#"><i class="fab fa-twitter"></i></a>
@@ -1270,7 +1296,7 @@ $js_temp_booking_data = json_encode($temp_booking_data);
         </div>
     </footer>
     <script>
-     const currentDate = '<?php echo $current_date; ?>';
+const currentDate = '<?php echo $current_date; ?>';
 let currentStep = 1;
 let paymentError = <?php echo $js_payment_error; ?>;
 let paymentType = <?php echo $js_payment_type; ?>;
@@ -1421,8 +1447,8 @@ function validateStep(step) {
         const address = document.getElementById('address').value;
         const location = document.getElementById('location').value;
 
-        if (!/^0[0-9]{9}$/.test(phone)) {
-            showError('phoneError', 'Phone number must be 10 digits starting with 0');
+        if (!/^0[89][0-9]{8}$/.test(phone)) {
+            showError('phoneError', 'Phone number must be 10 digits starting with 08 or 09');
         }
         if (!['Male', 'Female', 'Other'].includes(gender)) {
             showError('genderError', 'Please select a gender');
@@ -1444,8 +1470,8 @@ function validateStep(step) {
         if (!['Parent', 'Sibling', 'Spouse', 'Friend', 'Other'].includes(kinRelationship)) {
             showError('kinRelationshipError', 'Please select a relationship');
         }
-        if (!/^0[0-9]{9}$/.test(kinPhone)) {
-            showError('kinPhoneError', 'Phone number must be 10 digits starting with 0');
+        if (!/^0[89][0-9]{8}$/.test(kinPhone)) {
+            showError('kinPhoneError', 'Phone number must be 10 digits starting with 08 or 09');
         }
     } else if (step === 4) {
         const nationalId = document.getElementById('national_id').files[0];
@@ -1478,16 +1504,13 @@ document.getElementById('profile_picture').addEventListener('change', function (
     }
 });
 
-/// Initialize slider
+// Initialize slider
 function initializeSlider() {
     const slides = document.querySelector('.slides');
     const slideElements = document.querySelectorAll('.slide');
     const totalSlides = slideElements.length;
 
-    // Set slides container width based on number of slides
     slides.style.width = `${100 * totalSlides}%`;
-
-    // Set each slide to occupy full viewport width
     slideElements.forEach(slide => {
         slide.style.width = `${100 / totalSlides}%`;
     });
@@ -1513,10 +1536,7 @@ function initializeSlider() {
         }
     }
 
-    // Show the first slide
     showSlide(currentIndex);
-
-    // Auto-slide every 10 seconds
     setInterval(nextSlide, 10000);
 }
 
@@ -1667,18 +1687,16 @@ if (paymentError && paymentType) {
         showModal('paymentModal');
     }
     document.getElementById('paymentDetails').innerHTML = details;
-    // Show failure modal if payment error exists
     showPaymentFailureModal(paymentType);
 }
 
 // Process payment (placeholder)
 function processPayment() {
     const phone = document.getElementById('paymentPhone').value;
-    if (!/^0[0-9]{9}$/.test(phone)) {
+    if (!/^0[89][0-9]{8}$/.test(phone)) {
         document.getElementById('paymentPhoneError').style.display = 'block';
         return;
     }
-    // Simulate payment processing
     alert('Payment processing not implemented in this demo.');
     hideModal('paymentModal');
 }
@@ -1799,6 +1817,7 @@ document.getElementById('newBookingForm').addEventListener('submit', function (e
 });
 
 // Form validation for edit profile
+d// Form validation for edit profile
 document.getElementById('editProfileForm').addEventListener('submit', function (event) {
     let isValid = true;
     const firstName = document.getElementById('edit_first_name').value;
@@ -1812,55 +1831,76 @@ document.getElementById('editProfileForm').addEventListener('submit', function (
     const age = document.getElementById('edit_age').value;
     const occupation = document.getElementById('edit_occupation').value;
 
+    // Hide all existing error messages
     document.querySelectorAll('#editProfileForm .inline-error').forEach(error => error.style.display = 'none');
 
+    // Validate first name (2-50 letters)
     if (!/^[A-Za-z]{2,50}$/.test(firstName)) {
         document.getElementById('editFirstNameError').style.display = 'block';
         isValid = false;
     }
+
+    // Validate last name (2-50 letters)
     if (!/^[A-Za-z]{2,50}$/.test(lastName)) {
         document.getElementById('editLastNameError').style.display = 'block';
         isValid = false;
     }
+
+    // Validate username (3-50 alphanumeric characters or underscores)
     if (!/^[A-Za-z0-9_]{3,50}$/.test(username)) {
         document.getElementById('editUsernameError').style.display = 'block';
         isValid = false;
     }
+
+    // Validate email (basic email format)
     if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
         document.getElementById('editEmailError').style.display = 'block';
         isValid = false;
     }
-    if (!/^0[0-9]{9}$/.test(phone)) {
+
+    // Validate phone number (starts with 08 or 09, exactly 10 digits)
+    if (!/^0[89][0-9]{8}$/.test(phone)) {
         document.getElementById('editPhoneError').style.display = 'block';
         isValid = false;
     }
+
+    // Validate gender (must be Male, Female, or Other)
     if (!['Male', 'Female', 'Other'].includes(gender)) {
         document.getElementById('editGenderError').style.display = 'block';
         isValid = false;
     }
+
+    // Validate address (not empty)
     if (!address) {
         document.getElementById('editAddressError').style.display = 'block';
         isValid = false;
     }
+
+    // Validate location (must be one of the specified cities)
     if (!['Lilongwe', 'Blantyre', 'Mzuzu', 'Zomba'].includes(location)) {
         document.getElementById('editLocationError').style.display = 'block';
         isValid = false;
     }
+
+    // Validate age (between 18 and 100)
     if (age < 18 || age > 100) {
         document.getElementById('editAgeError').style.display = 'block';
         isValid = false;
     }
+
+    // Validate occupation (not empty)
     if (!occupation) {
         document.getElementById('editOccupationError').style.display = 'block';
         isValid = false;
     }
 
+    // Prevent form submission if validation fails
     if (!isValid) {
         event.preventDefault();
     }
 });
 
-// Clear inline errors on input
+// Clear inline errors when user starts typing
 document.querySelectorAll('input, select, textarea').forEach(input => {
     input.addEventListener('input', function () {
         const errorId = this.getAttribute('aria-describedby');
@@ -1870,12 +1910,12 @@ document.querySelectorAll('input, select, textarea').forEach(input => {
     });
 });
 
-// Initialize page
+// Initialize page when DOM is fully loaded
 document.addEventListener('DOMContentLoaded', function () {
-    showSection('home');
-    initializeSlider();
+    showSection('home'); // Show the home section by default
+    initializeSlider();  // Initialize any slider components
 
-    // Populate signup form with temp data if available
+    // Populate signup form with temporary data if available
     if (tempSignupData) {
         document.getElementById('first_name').value = tempSignupData.first_name || '';
         document.getElementById('last_name').value = tempSignupData.last_name || '';
@@ -1892,17 +1932,7 @@ document.addEventListener('DOMContentLoaded', function () {
         document.getElementById('occupation').value = tempSignupData.occupation || '';
     }
 });
-    </script>
-                 
-    </body>
-    </html>
-    <?php
-// Clean up any remaining session data if necessary
-if (isset($_SESSION['temp_signup_data']) && !isset($payment_error)) {
-    unset($_SESSION['temp_signup_data']);
-}
-if (isset($_SESSION['temp_booking_data']) && !isset($payment_error)) {
-    unset($_SESSION['temp_booking_data']);
-}
-?>
-    
+
+</script>
+</body>
+</html>

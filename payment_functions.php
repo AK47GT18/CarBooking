@@ -52,18 +52,31 @@ function initiateUSSDPayment($pdo, $user_id, $amount, $type, $booking_id = null,
 
         // Validate and format mobile number
         $mobile = preg_replace('/[^0-9]/', '', $user['phone']);
-        if (!preg_match('/^0[0-9]{9}$/', $mobile)) {
-            return ['error' => 'Invalid mobile number format. Must be 10 digits starting with 0 (e.g., 0885620896).', 'type' => $type];
+        if (!preg_match('/^0[89][0-9]{8}$/', $mobile)) {
+            return ['error' => 'Invalid mobile number format. Must be 10 digits starting with 08 (TNM) or 09 (Airtel) (e.g., 0885620896 or 0999123456).', 'type' => $type];
+        }
+
+        // Determine mobile operator and reference ID based on prefix
+        $prefix = substr($mobile, 0, 2);
+        if ($prefix === '08') {
+            $operator = 'TNM';
+            $mobile_money_ref_id = PAYCHANGU_TNM_REF_ID;
+        } elseif ($prefix === '09') {
+            $operator = 'Airtel';
+            $mobile_money_ref_id = PAYCHANGU_AIRTEL_REF_ID;
+        } else {
+            return ['error' => 'Unsupported mobile operator. Use 08 for TNM or 09 for Airtel.', 'type' => $type];
         }
 
         $charge_id = 'CHG-' . time() . '-' . rand(1000, 9999);
         $payload = [
-            'mobile_money_operator_ref_id' => PAYCHANGU_MOBILE_MONEY_REF_ID,
+            'mobile_money_operator_ref_id' => $mobile_money_ref_id,
             'mobile' => $mobile,
             'amount' => $amount,
             'charge_id' => $charge_id,
             'email' => $user['email'],
             'first_name' => $user['username'],
+            'operator' => $operator
         ];
 
         $client = new Client([
@@ -84,20 +97,22 @@ function initiateUSSDPayment($pdo, $user_id, $amount, $type, $booking_id = null,
         }
 
         // Store pending payment in database
-        $stmt = $pdo->prepare("INSERT INTO payments (user_id, booking_id, charge_id, amount, status, type) VALUES (?, ?, ?, ?, 'pending', ?)");
-        $stmt->execute([$user_id ?: null, $booking_id, $charge_id, $amount, $type]);
+        $tx_ref = $result['data']['tx_ref'] ?? null;
+        $stmt = $pdo->prepare("INSERT INTO payments (user_id, booking_id, charge_id, tx_ref, amount, status, type, operator) VALUES (?, ?, ?, ?, ?, 'pending', ?, ?)");
+        $stmt->execute([$user_id ?: null, $booking_id, $charge_id, $tx_ref, $amount, $type, $operator]);
 
         try {
             // Enforce 1-minute timeout (60 seconds / 5-second intervals = 12 attempts)
             $successfulData = pollForSuccess($charge_id, $client, 5, 12);
-            $stmt = $pdo->prepare("UPDATE payments SET status = 'success' WHERE charge_id = ?");
-            $stmt->execute([$charge_id]);
+            $tx_ref = $successfulData['tx_ref'] ?? $tx_ref;
+            $stmt = $pdo->prepare("UPDATE payments SET status = 'success', tx_ref = ? WHERE charge_id = ?");
+            $stmt->execute([$tx_ref, $charge_id]);
 
             // Insert data into database after payment confirmation
             if ($type === 'signup') {
                 $stmt = $pdo->prepare("
-                    INSERT INTO users (username, email, phone, password, gender, address, location, kin_name, kin_relationship, kin_phone, national_id, profile_picture, age, status, payment_status)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', 'paid')
+                    INSERT INTO users (username, email, phone, password, gender, address, location, kin_name, kin_relationship, kin_phone, national_id, profile_picture, age, status, payment_status, first_name, last_name, occupation)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', 'paid', ?, ?, ?)
                 ");
                 $stmt->execute([
                     $temp_data['username'],
@@ -112,7 +127,10 @@ function initiateUSSDPayment($pdo, $user_id, $amount, $type, $booking_id = null,
                     $temp_data['kin_phone'],
                     $temp_data['national_id'],
                     $temp_data['profile_picture'],
-                    $temp_data['age']
+                    $temp_data['age'],
+                    $temp_data['first_name'],
+                    $temp_data['last_name'],
+                    $temp_data['occupation']
                 ]);
                 $user_id = $pdo->lastInsertId();
 
@@ -122,6 +140,10 @@ function initiateUSSDPayment($pdo, $user_id, $amount, $type, $booking_id = null,
                 // Update payment with user_id
                 $stmt = $pdo->prepare("UPDATE payments SET user_id = ? WHERE charge_id = ?");
                 $stmt->execute([$user_id, $charge_id]);
+
+                // Clean up temporary files
+                @unlink($temp_data['national_id_path'] ?? '');
+                @unlink($temp_data['profile_picture_path'] ?? '');
             } elseif ($type === 'booking') {
                 $stmt = $pdo->prepare("
                     INSERT INTO bookings (user_id, car_id, booking_id, pick_up_date, return_date, total_days, total_cost, status, payment_status)
@@ -138,7 +160,7 @@ function initiateUSSDPayment($pdo, $user_id, $amount, $type, $booking_id = null,
                 ]);
                 $booking_db_id = $pdo->lastInsertId();
 
-                $stmt = $pdo->prepare("UPDATE cars SET status = 'booked' WHERE id = ?");
+                $stmt = $pdo->prepare("UPDATE cars SET status = 'booked', booking_count = booking_count + 1 WHERE id = ?");
                 $stmt->execute([$temp_data['car_id']]);
 
                 $stmt = $pdo->prepare("SELECT b.booking_id, b.pick_up_date, b.return_date, b.total_cost, c.name AS car_name FROM bookings b LEFT JOIN cars c ON b.car_id = c.id WHERE b.id = ?");
@@ -164,7 +186,6 @@ function initiateUSSDPayment($pdo, $user_id, $amount, $type, $booking_id = null,
             $stmt = $pdo->prepare("UPDATE payments SET status = 'failed' WHERE charge_id = ?");
             $stmt->execute([$charge_id]);
             $error = $e->getMessage();
-            // Include payment type in error response for frontend handling
             return ['error' => $error, 'type' => $type, 'car_id' => $temp_data['car_id'] ?? null, 'car_name' => $temp_data['car_name'] ?? null, 'price_per_day' => $temp_data['price_per_day'] ?? null];
         }
     } catch (RequestException $e) {
@@ -182,4 +203,3 @@ function initiateUSSDPayment($pdo, $user_id, $amount, $type, $booking_id = null,
         return ['error' => 'Database error: Unable to process payment. Please try again later.', 'type' => $type];
     }
 }
-?>
